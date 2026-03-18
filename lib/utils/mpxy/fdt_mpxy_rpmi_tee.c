@@ -18,8 +18,8 @@
 #include <sbi/sbi_string.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_mbox.h>
+#include <sbi_utils/mpxy/fdt_mpxy_rpmi_tee.h>
 #include <sbi_utils/mailbox/rpmi_mailbox.h>
-#include <sbi_utils/tee/tee_dispatcher.h>
 
 /**
  * TEE MPXY channel context
@@ -37,6 +37,10 @@ struct mpxy_tee {
 	struct mpxy_rpmi_channel_attrs msgprot_attrs;
 	/** MPXY channel instance */
 	struct sbi_mpxy_channel channel;
+	/** Owner Hart ID of this channel */
+	u32 hartid;
+	/** List node for TEE instance tracking */
+	struct sbi_dlist node;
 };
 
 /**
@@ -156,6 +160,50 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 	return rc;
 }
 
+/** List to track all registered TEE instances for hartid lookup */
+static SBI_LIST_HEAD(mpxy_tee_list);
+
+/**
+ * Find TEE MPXY channel by hartid
+ *
+ * Each TEE MPXY channel is associated with a specific hart. This function
+ * searches the registered TEE channels and returns the MPXY channel
+ * for the specified hartid.
+ *
+ * @param hartid: The hart ID to search for
+ * @return Pointer to the MPXY channel, or NULL if not found
+ */
+struct sbi_mpxy_channel *mpxy_tee_find_channel_by_hartid(u32 hartid)
+{
+	struct mpxy_tee *tee;
+
+	sbi_list_for_each_entry(tee, &mpxy_tee_list, node)
+		if (tee->hartid == hartid)
+			return &tee->channel;
+
+	return NULL;
+}
+
+/**
+ * Get TEE dispatcher from TEE MPXY channel
+ *
+ * This function extracts the TEE dispatcher from a TEE MPXY channel.
+ * Used by the reqfwd driver for lazy callback registration.
+ *
+ * @param channel: Pointer to TEE MPXY channel
+ * @return Pointer to TEE dispatcher, or NULL if not found
+ */
+struct tee_dispatcher *mpxy_tee_get_dispatcher(struct sbi_mpxy_channel *channel)
+{
+	struct mpxy_tee *tee;
+
+	if (!channel)
+		return NULL;
+
+	tee = container_of(channel, struct mpxy_tee, channel);
+	return tee->dispatcher;
+}
+
 /**
  * Initialize TEE MPXY channel
  *
@@ -167,8 +215,8 @@ static int mpxy_tee_init(const void *fdt, int nodeoff,
 {
 	struct mpxy_tee *tee;
 	const fdt32_t *val;
-	u32 channel_id;
-	int rc, len;
+	u32 channel_id, hartid;
+	int rc, len, cpu_offset;
 
 	/* Allocate context for TEE MPXY */
 	tee = sbi_zalloc(sizeof(*tee));
@@ -183,6 +231,19 @@ static int mpxy_tee_init(const void *fdt, int nodeoff,
 		rc = SBI_EINVAL;
 		goto fail_free;
 	}
+
+	/* Get parent CPU node to extract hartid from its reg property */
+	cpu_offset = fdt_parent_offset(fdt, nodeoff);
+	if (cpu_offset < 0) {
+		rc = SBI_EINVAL;
+		goto fail_free;
+	}
+
+	rc = fdt_parse_hart_id(fdt, cpu_offset, &hartid);
+	if (rc)
+		goto fail_free;
+
+	tee->hartid = hartid;
 
 	/* Setup TEE dispatcher from device tree */
 	rc = tee_dispatcher_setup(fdt, nodeoff, &tee->dispatcher);
@@ -216,6 +277,9 @@ static int mpxy_tee_init(const void *fdt, int nodeoff,
 	rc = sbi_mpxy_register_channel(&tee->channel);
 	if (rc)
 		goto fail_free;
+
+	/* Add to TEE list for hartid lookup */
+	sbi_list_add_tail(&tee->node, &mpxy_tee_list);
 
 	return SBI_OK;
 

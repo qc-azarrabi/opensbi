@@ -1049,6 +1049,7 @@ struct rpmi_reqfwd_complete_current_message_req {
 
 struct rpmi_reqfwd_complete_current_message_resp {
 	s32 status;
+	u32 num_messages;
 };
 
 #endif /* !__RPMI_MSGPROT_H__ */

@@ -6,7 +6,6 @@
 
 #include <libfdt.h>
 #include <sbi/sbi_console.h>
-#include <sbi/sbi_domain.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_fifo.h>
 #include <sbi/sbi_hart.h>
@@ -15,6 +14,8 @@
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_string.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_mbox.h>
+#include <sbi_utils/mpxy/fdt_mpxy_rpmi_reqfwd.h>
+#include <sbi_utils/mpxy/fdt_mpxy_rpmi_tee.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 
 /** RPMI Message */
@@ -44,6 +45,8 @@ struct mpxy_reqfwd {
 	struct sbi_fifo msg_fifo;
 	/* Current forwarded RPMI request message */
 	struct rpmi_message_slot current_msg;
+	/* Flag indicating if current_msg contains valid data being retrieved */
+	bool has_current_msg;
 
 	/* Receiver side is waiting for message */
 	bool is_waiting_message;
@@ -51,41 +54,86 @@ struct mpxy_reqfwd {
 	void *rx;
 	/* Maximum receiver RX length */
 	u32 rx_max_len;
-	/* Length of responce of current message */
+	/* Length of response of current message */
 	unsigned long ack_len;
 	/* List node for reqfwd instance tracking */
 	struct sbi_dlist node;
 };
 
 static int retrieve_message(struct mpxy_reqfwd *reqfwd,
+			    void *tx, u32 tx_len,
 			    void *rx, u32 rx_max_len, unsigned long *ack_len)
 {
 	struct rpmi_message_slot *current_msg = &reqfwd->current_msg;
-	u32 datalen;
+	struct rpmi_reqfwd_retrieve_current_message_req *req = tx;
+	struct rpmi_reqfwd_retrieve_current_message_resp *resp = rx;
+	u32 start_index, datalen, available_space, chunk_size, remaining;
 	int rc;
 
-	/* Dequeue oldest forwarded RPMI request message */
-	rc = sbi_fifo_dequeue(&reqfwd->msg_fifo, current_msg);
-	if (!rc) {
-		/* Get data length from RPMI message header */
-		datalen = le16_to_cpu(current_msg->header.datalen);
-		if (rx_max_len < datalen)
-			return SBI_ENOMEM;
-
-		/* STATUS */
-		((u32 *)rx)[0] = cpu_to_le32(RPMI_SUCCESS);
-		/* REMAINING */
-		((u32 *)rx)[1] = cpu_to_le32(0);
-		/* RETURNED */
-		((u32 *)rx)[2] = cpu_to_le32(datalen);
-		/* REQUEST_MESSAGE[N] */
-		sbi_memcpy(&((u32 *)rx)[3], current_msg->data, datalen);
-		*ack_len = 3 * sizeof(u32) + datalen;
-
-		reqfwd->is_waiting_message = false;
+	if (tx_len < sizeof(*req)) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*ack_len = sizeof(resp->status);
+		return SBI_OK;
 	}
 
-	return rc;
+	start_index = le32_to_cpu(req->start_index);
+
+	/*
+	 * Chunked Retrieval Logic:
+	 * - START_INDEX=0: Dequeue new message (first call or new message)
+	 * - START_INDEX>0: Continue retrieving current message
+	 */
+	if (start_index == 0) {
+		/*
+		 * First call or new message request.
+		 * Dequeue oldest forwarded RPMI request message from FIFO.
+		 */
+		rc = sbi_fifo_dequeue(&reqfwd->msg_fifo, current_msg);
+		if (rc)
+			return rc;
+
+		/* Mark that we now have a valid current message */
+		reqfwd->has_current_msg = true;
+		reqfwd->is_waiting_message = false;
+	} else {
+		if (!reqfwd->has_current_msg) {
+			resp->status = cpu_to_le32(RPMI_ERR_NO_DATA);
+			*ack_len = sizeof(resp->status);
+			return SBI_OK;
+		}
+	}
+
+	datalen = le16_to_cpu(current_msg->header.datalen);
+
+	/* Validate START_INDEX within message bounds */
+	if (start_index >= datalen) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*ack_len = sizeof(resp->status);
+		return SBI_OK;
+	}
+
+	/* Calculate chunk size based on available buffer space */
+	available_space = rx_max_len - offsetof(struct rpmi_reqfwd_retrieve_current_message_resp,
+						 request_message);
+	chunk_size = datalen - start_index;
+	if (chunk_size > available_space)
+		chunk_size = available_space;
+
+	remaining = datalen - start_index - chunk_size;
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
+	resp->remaining = cpu_to_le32(remaining);
+	resp->returned = cpu_to_le32(chunk_size);
+	sbi_memcpy(resp->request_message, &current_msg->data[start_index], chunk_size);
+
+	*ack_len = offsetof(struct rpmi_reqfwd_retrieve_current_message_resp,
+			    request_message) + chunk_size;
+
+	/* Clear flag when message fully retrieved */
+	if (remaining == 0)
+		reqfwd->has_current_msg = false;
+
+	return SBI_OK;
 }
 
 /** List to track all registered reqfwd instances for hartid lookup */
@@ -121,7 +169,6 @@ int mpxy_reqfwd_forward_message(struct sbi_mpxy_channel *channel,
 {
 	struct mpxy_reqfwd *reqfwd;
 	struct rpmi_message_slot msg;
-	int rc;
 
 	if (!tx || tx_len > RPMI_MSG_DATA_SIZE(RPMI_SLOT_SIZE_MIN))
 		return SBI_EINVAL;
@@ -140,11 +187,14 @@ int mpxy_reqfwd_forward_message(struct sbi_mpxy_channel *channel,
 	sbi_fifo_enqueue(&reqfwd->msg_fifo, &msg, true);
 
 	if (reqfwd->is_waiting_message) {
+		int rc;
+		u32 start_index = 0;
 		/*
 		 * The callee domain is waiting for message.
 		 * We immediately retrieve message and switch into it.
 		 */
-		rc = retrieve_message(reqfwd, reqfwd->rx, reqfwd->rx_max_len,
+		rc = retrieve_message(reqfwd, &start_index, sizeof(start_index),
+				      reqfwd->rx, reqfwd->rx_max_len,
 				      ack_len);
 		if (rc)
 			return rc;
@@ -188,62 +238,82 @@ static int mpxy_reqfwd_send_message_withresp(struct sbi_mpxy_channel *channel,
 	struct mpxy_reqfwd *reqfwd =
 		container_of(channel, struct mpxy_reqfwd, channel);
 	struct rpmi_message_slot *current_msg = &reqfwd->current_msg;
+	struct sbi_mpxy_channel *tee_channel;
+	struct tee_dispatcher *dispatcher;
 	int rc;
 
 	if (RPMI_REQFWD_SRV_RETRIEVE_CURRENT_MESSAGE == message_id) {
-		/* Dequeue oldest forwarded RPMI request message */
-		rc = retrieve_message(reqfwd, rx, rx_max_len, ack_len);
+		rc = retrieve_message(reqfwd, tx, tx_len, rx, rx_max_len, ack_len);
 		if (rc == SBI_OK || rc == SBI_EINVAL)
 			return rc;
 
-		/* No more message. Switch back to caller domain */
-		*ack_len = reqfwd->ack_len;
-		reqfwd->ack_len = 0;
+		/* No message available */
+		if (rc == SBI_ENOENT) {
+			struct rpmi_reqfwd_retrieve_current_message_resp *resp = rx;
 
-		/* Record this domain is waiting for message */
-		reqfwd->is_waiting_message = true;
-		reqfwd->rx = rx;
-		reqfwd->rx_max_len = rx_max_len;
+			/* Try domain_exit if TEE channel available */
+			tee_channel = mpxy_tee_find_channel_by_hartid(reqfwd->hartid);
+			if (tee_channel) {
+				dispatcher = mpxy_tee_get_dispatcher(tee_channel);
+				if (dispatcher && dispatcher->ops &&
+				    dispatcher->ops->domain_exit) {
+					*ack_len = reqfwd->ack_len;
+					reqfwd->ack_len = 0;
+					/* TEE use case: save state before domain_exit */
+					reqfwd->is_waiting_message = true;
+					reqfwd->rx = rx;
+					reqfwd->rx_max_len = rx_max_len;
 
-		/* Switch to other domain */
-		sbi_domain_context_exit();
+					dispatcher->ops->domain_exit(dispatcher);
+					return SBI_OK;
+				}
+			}
+
+			/* Non-TEE use case */
+			resp->status = cpu_to_le32(RPMI_ERR_NO_DATA);
+			resp->remaining = cpu_to_le32(0);
+			resp->returned = cpu_to_le32(0);
+			*ack_len = offsetof(struct rpmi_reqfwd_retrieve_current_message_resp,
+					    request_message);
+			return SBI_OK;
+		}
+
+		return rc;
 	} else if (RPMI_REQFWD_SRV_COMPLETE_CURRENT_MESSAGE == message_id) {
+		struct rpmi_reqfwd_complete_current_message_req *req = tx;
+		struct rpmi_reqfwd_complete_current_message_resp *resp = rx;
+		u32 num_messages;
+
 		if (current_msg->header.servicegroup_id) {
-			/*
-			 * Fill response data into RX buffer of original sender.
-			 *
-			 * If a transformation callback was provided when the
-			 * message was forwarded, use it to transform the response
-			 * before copying to the sender's buffer. This allows
-			 * TEE-specific response handling without coupling reqfwd
-			 * to any particular TEE implementation.
-			 */
+			/* Apply transformation callback if provided */
 			if (current_msg->transform_fn) {
 				rc = current_msg->transform_fn(
-					tx, tx_len,
+					req->response_data, tx_len,
 					current_msg->sender_rx,
 					current_msg->sender_rx_max_len,
 					&reqfwd->ack_len);
 				if (rc) {
-					/* STATUS */
-					((u32 *)rx)[0] = cpu_to_le32(RPMI_ERR_FAILED);
-					*ack_len = sizeof(u32);
+					resp->status = cpu_to_le32(RPMI_ERR_FAILED);
+					resp->num_messages = cpu_to_le32(0);
+					*ack_len = sizeof(*resp);
 					return SBI_OK;
 				}
 			} else {
 				/* No transformation - copy response as-is */
-				sbi_memcpy(current_msg->sender_rx, tx, tx_len);
+				sbi_memcpy(current_msg->sender_rx, req->response_data, tx_len);
 				reqfwd->ack_len = tx_len;
 			}
-			/* Clear current message */
 			sbi_memset(current_msg, 0, sizeof(*current_msg));
-			/* STATUS */
-			((u32 *)rx)[0] = cpu_to_le32(RPMI_SUCCESS);
+
+			num_messages = sbi_fifo_avail(&reqfwd->msg_fifo);
+
+			resp->status = cpu_to_le32(RPMI_SUCCESS);
+			resp->num_messages = cpu_to_le32(num_messages);
 		} else {
-			/* STATUS */
-			((u32 *)rx)[0] = cpu_to_le32(RPMI_ERR_NO_DATA);
+			resp->status = cpu_to_le32(RPMI_ERR_NO_DATA);
+			resp->num_messages = cpu_to_le32(0);
 		}
-		*ack_len = sizeof(u32);
+		*ack_len = sizeof(*resp);
 	} else {
 		return SBI_EFAIL;
 	}

@@ -82,6 +82,13 @@ struct tee_dispatcher_ops {
 	 * @return 0 on success, negative error code on failure
 	 */
 	int (*domain_enter)(const struct tee_dispatcher *dispatcher);
+
+	/**
+	 * Exit TEE domain (optional, for domain-based TEEs)
+	 * @param dispatcher: TEE dispatcher instance
+	 * @return 0 on success, negative error code on failure
+	 */
+	int (*domain_exit)(const struct tee_dispatcher *dispatcher);
 };
 
 /**

@@ -15,6 +15,7 @@
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/mailbox/rpmi_msgprot.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_mbox.h>
+#include <sbi_utils/mpxy/fdt_mpxy_rpmi_reqfwd.h>
 #include <sbi_utils/tee/tee_dispatcher.h>
 
 /* OP-TEE specific context */
@@ -226,11 +227,28 @@ static int optee_domain_enter(const struct tee_dispatcher *dispatcher)
 	return sbi_domain_context_enter(ctx->domain);
 }
 
+/**
+ * Exit OP-TEE domain
+ */
+static int optee_domain_exit(const struct tee_dispatcher *dispatcher)
+{
+	struct optee_context *ctx = dispatcher->context;
+
+	if (!ctx)
+		return SBI_EINVAL;
+
+	if (!ctx->domain)
+		return SBI_ENOENT;
+
+	return sbi_domain_context_exit();
+}
+
 /** OP-TEE dispatcher operations */
 static const struct tee_dispatcher_ops optee_ops = {
 	.get_attributes = optee_get_attributes,
 	.communicate = optee_communicate,
 	.domain_enter = optee_domain_enter,
+	.domain_exit = optee_domain_exit,
 };
 
 /**
