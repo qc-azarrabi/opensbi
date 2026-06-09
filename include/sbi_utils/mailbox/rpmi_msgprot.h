@@ -75,6 +75,8 @@
 /** Minimum slot size in bytes */
 #define RPMI_SLOT_SIZE_MIN			(128)
 
+#define RPMI_REQFWD_FIFO_SLOT_SIZE		(128)
+
 /** Name length of 16 characters */
 #define RPMI_NAME_CHARS_MAX			(16)
 

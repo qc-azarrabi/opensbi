@@ -76,6 +76,7 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 	struct mpxy_tee *tee =
 		container_of(channel, struct mpxy_tee, channel);
 	struct rpmi_tee_get_attributes_resp *attr_resp;
+	s32 *status = (s32 *)respbuf;
 	int rc = SBI_OK;
 
 	if (!tee->dispatcher)
@@ -110,9 +111,8 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 
 		if (tee->dispatcher->ops->communicate) {
 			unsigned long data_len = 0;
-			s32 *status = (s32 *)respbuf;
-			void *data_buf = (u8 *)respbuf + sizeof(s32);
-			u32 data_max_len = resp_max_len - sizeof(s32);
+			void *data_buf = (u8 *)respbuf + sizeof(u32);
+			u32 data_max_len = resp_max_len - sizeof(u32);
 
 			rc = tee->dispatcher->ops->communicate(
 				tee->dispatcher,
@@ -143,16 +143,23 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 				}
 
 				*status = cpu_to_le32(RPMI_SUCCESS);
-				*resp_len = sizeof(s32) + data_len;
+				/*
+				 * data_len may be the REQFWD RETRIEVE
+				 * response length when resuming a waiting
+				 * OP-TEE domain.
+				 * It already includes the RPMI status/header.
+				 * Should not add the TEE status word here.
+				 */
+				*resp_len = data_len;
 			}
 		} else {
-			((s32 *)respbuf)[0] = cpu_to_le32(RPMI_ERR_NOTSUPP);
+			*status = cpu_to_le32(RPMI_ERR_NOTSUPP);
 			*resp_len = sizeof(s32);
 		}
 		break;
 
 	default:
-		((u32 *)respbuf)[0] = cpu_to_le32(RPMI_ERR_NOTSUPP);
+		*status = cpu_to_le32(RPMI_ERR_NOTSUPP);
 		*resp_len = sizeof(u32);
 		break;
 	}

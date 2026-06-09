@@ -21,7 +21,7 @@
 /** RPMI Message */
 struct rpmi_message_slot {
 	struct rpmi_message_header header;
-	u8 data[RPMI_MSG_DATA_SIZE(RPMI_SLOT_SIZE_MIN)];
+	u8 data[RPMI_MSG_DATA_SIZE(RPMI_REQFWD_FIFO_SLOT_SIZE)];
 
 	/* Sender RX address. Should be MPXY shared memory */
 	void *sender_rx;
@@ -113,8 +113,7 @@ static int retrieve_message(struct mpxy_reqfwd *reqfwd,
 	}
 
 	/* Calculate chunk size based on available buffer space */
-	available_space = rx_max_len - offsetof(struct rpmi_reqfwd_retrieve_current_message_resp,
-						 request_message);
+	available_space = RPMI_MSG_DATA_SIZE(RPMI_SLOT_SIZE_MIN) - offsetof(struct rpmi_reqfwd_retrieve_current_message_resp, request_message);
 	chunk_size = datalen - start_index;
 	if (chunk_size > available_space)
 		chunk_size = available_space;
@@ -170,7 +169,7 @@ int mpxy_reqfwd_forward_message(struct sbi_mpxy_channel *channel,
 	struct mpxy_reqfwd *reqfwd;
 	struct rpmi_message_slot msg;
 
-	if (!tx || tx_len > RPMI_MSG_DATA_SIZE(RPMI_SLOT_SIZE_MIN))
+	if (!tx || tx_len > RPMI_MSG_DATA_SIZE(RPMI_REQFWD_FIFO_SLOT_SIZE))
 		return SBI_EINVAL;
 
 	reqfwd = container_of(channel, struct mpxy_reqfwd, channel);
