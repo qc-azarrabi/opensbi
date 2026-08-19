@@ -991,9 +991,30 @@ struct rpmi_mm_communicate_rsp {
 /** RPMI TEE ServiceGroup Service IDs */
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
-	RPMI_TEE_SRV_GET_ATTRIBUTES = 0x02,
+	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
 	RPMI_TEE_SRV_COMMUNICATE = 0x03,
 	RPMI_TEE_SRV_MAX_COUNT,
+};
+
+/** RPMI TEE feature IDs for TEE_PROBE_FEATURES */
+enum rpmi_tee_feature_id {
+	RPMI_TEE_FEAT_MEMORY_DONATE = 1,
+	RPMI_TEE_FEAT_MEMORY_LEND = 2,
+	RPMI_TEE_FEAT_MEMORY_SHARE = 3,
+	RPMI_TEE_FEAT_SIGNAL_BUS = 4,
+	RPMI_TEE_FEAT_MULTISEGMENT_OPS = 5,
+	RPMI_TEE_FEAT_SYSINFO_FORMAT = 6,
+};
+
+/** TEE_PROBE_FEATURES request */
+struct rpmi_tee_probe_features_req {
+	u32 feature_id;
+};
+
+/** TEE_PROBE_FEATURES response */
+struct rpmi_tee_probe_features_resp {
+	s32 status;
+	u32 value;
 };
 
 /** TEE Implementation IDs */

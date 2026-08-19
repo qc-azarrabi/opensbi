@@ -75,7 +75,6 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 {
 	struct mpxy_tee *tee =
 		container_of(channel, struct mpxy_tee, channel);
-	struct rpmi_tee_get_attributes_resp *attr_resp;
 	s32 *status = (s32 *)respbuf;
 	int rc = SBI_OK;
 
@@ -83,16 +82,57 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 		return SBI_ENODEV;
 
 	switch (msg_id) {
-	case RPMI_TEE_SRV_GET_ATTRIBUTES:
-		if (resp_max_len < sizeof(*attr_resp))
+	case RPMI_TEE_SRV_ENABLE_NOTIFICATION:
+		/*
+		 * The TEE service group defines no events, so notification
+		 * enable is answered directly by the framework as
+		 * not-supported. No TEE domain involvement.
+		 */
+		if (resp_max_len < sizeof(s32))
 			return SBI_ENOMEM;
-		attr_resp = respbuf;
-		attr_resp->status = cpu_to_le32(RPMI_SUCCESS);
-		attr_resp->tee_impl_id = cpu_to_le32(tee->attrs.tee_impl_id);
-		attr_resp->comm_req_regs = cpu_to_le32(tee->attrs.comm_req_regs);
-		attr_resp->comm_resp_regs = cpu_to_le32(tee->attrs.comm_resp_regs);
-		*resp_len = sizeof(*attr_resp);
+		*status = cpu_to_le32(RPMI_ERR_NOTSUPP);
+		*resp_len = sizeof(s32);
 		break;
+
+	case RPMI_TEE_SRV_PROBE_FEATURES: {
+		/*
+		 * TEE_PROBE_FEATURES is answered directly by the framework
+		 * (no TEE domain involvement). None of the optional features
+		 * are supported by this prototype; an unknown feature id is
+		 * rejected.
+		 */
+		struct rpmi_tee_probe_features_req *feat_req = msgbuf;
+		struct rpmi_tee_probe_features_resp *feat_resp = respbuf;
+		u32 feature_id;
+
+		if (resp_max_len < sizeof(*feat_resp))
+			return SBI_ENOMEM;
+		if (msg_len < sizeof(*feat_req)) {
+			feat_resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+			feat_resp->value = 0;
+			*resp_len = sizeof(*feat_resp);
+			break;
+		}
+
+		feature_id = le32_to_cpu(feat_req->feature_id);
+		switch (feature_id) {
+		case RPMI_TEE_FEAT_MEMORY_DONATE:
+		case RPMI_TEE_FEAT_MEMORY_LEND:
+		case RPMI_TEE_FEAT_MEMORY_SHARE:
+		case RPMI_TEE_FEAT_SIGNAL_BUS:
+		case RPMI_TEE_FEAT_MULTISEGMENT_OPS:
+		case RPMI_TEE_FEAT_SYSINFO_FORMAT:
+			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
+			feat_resp->value = 0;
+			break;
+		default:
+			feat_resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+			feat_resp->value = 0;
+			break;
+		}
+		*resp_len = sizeof(*feat_resp);
+		break;
+	}
 
 	case RPMI_TEE_SRV_COMMUNICATE:
 		/*
