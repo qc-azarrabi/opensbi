@@ -420,6 +420,16 @@ int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
 	resp->block_cnt = cpu_to_le32(p->block_cnt);
 	*resp_len = resp_bytes;
 
+	/*
+	 * Owner-transfer (donate): ownership moves to the acceptor, so the
+	 * creator can never reclaim it. Destroy the handle on accept; a later
+	 * reclaim of the same id then fails lookup.
+	 */
+	if (p->flags & RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER) {
+		p->state = RPMI_PARCEL_DESTROYED;
+		parcel_recycle(p);
+	}
+
 	spin_unlock(&parcel_lock);
 	return SBI_OK;
 }
