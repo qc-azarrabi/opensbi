@@ -30,6 +30,7 @@
 
 enum rpmi_parcel_state {
 	RPMI_PARCEL_FREE = 0,
+	RPMI_PARCEL_CONSTRUCTING,
 	RPMI_PARCEL_CREATED,
 	RPMI_PARCEL_ACCEPTED,
 	RPMI_PARCEL_RELEASED,
@@ -58,6 +59,8 @@ struct rpmi_parcel {
 	u32 block_cnt;
 	struct rpmi_parcel_block blocks[RPMI_PARCEL_MAX_BLOCKS];
 	u64 total_pages;
+	u32 next_segment_idx;	/* multi-segment construction cursor */
+	u32 next_receive_idx;	/* multi-segment receive cursor */
 };
 
 static struct rpmi_parcel parcel_pool[RPMI_PARCEL_POOL_SIZE];
@@ -134,6 +137,42 @@ static bool parcel_all_released(const struct rpmi_parcel *p)
 	return true;
 }
 
+/*
+ * Validate ownership of and append a batch of blocks to a parcel under
+ * construction. blk_high[n]/blk_low[n] are the block-list arrays in wire order.
+ * Returns an RPMI_* status; the parcel lock must be held by the caller.
+ */
+static int parcel_append_blocks(struct rpmi_parcel *p, const u32 *blk_high,
+				const u32 *blk_low, u32 n)
+{
+	u32 i;
+
+	if (p->block_cnt + n > RPMI_PARCEL_MAX_BLOCKS)
+		return RPMI_ERR_INVALID_PARAM;
+
+	for (i = 0; i < n; i++) {
+		u32 high = le32_to_cpu(blk_high[i]);
+		u32 low = le32_to_cpu(blk_low[i]);
+		u64 page = RPMI_TEE_PARCEL_BLOCK_PAGE_NUM(high, low);
+		u32 pages = RPMI_TEE_PARCEL_BLOCK_PAGES(low);
+		u64 base = page << 12;
+		u64 size = (u64)pages << 12;
+
+		if (!sbi_domain_check_addr_range(sbi_domain_thishart_ptr(),
+						 base, size, PRV_S,
+						 SBI_DOMAIN_READ |
+						 SBI_DOMAIN_WRITE))
+			return RPMI_ERR_DENIED;
+
+		p->blocks[p->block_cnt].base = base;
+		p->blocks[p->block_cnt].page_count = pages;
+		p->block_cnt++;
+		p->total_pages += pages;
+	}
+
+	return RPMI_SUCCESS;
+}
+
 int rpmi_tee_parcel_create(void *msgbuf, u32 msg_len,
 			   void *respbuf, u32 resp_max_len,
 			   unsigned long *resp_len)
@@ -164,9 +203,16 @@ int rpmi_tee_parcel_create(void *msgbuf, u32 msg_len,
 		goto invalid;
 	if (!receiver_cnt || receiver_cnt > RPMI_PARCEL_MAX_RECEIVERS)
 		goto invalid;
-	if (!block_cnt || block_cnt > RPMI_PARCEL_MAX_BLOCKS)
+	if (block_cnt > RPMI_PARCEL_MAX_BLOCKS)
 		goto invalid;
-	if (flags & RPMI_TEE_PARCEL_CREATE_FLAG_MULTI_SEGMENT)
+	/*
+	 * A MULTI_SEGMENT parcel is built incrementally: CREATE carries the
+	 * receiver metadata plus an optional first batch of blocks (possibly
+	 * none) and leaves the parcel "constructing"; SEGMENT_SEND appends the
+	 * remaining blocks and the LAST segment finalizes it. A single-shot
+	 * CREATE must carry at least one block.
+	 */
+	if (!(flags & RPMI_TEE_PARCEL_CREATE_FLAG_MULTI_SEGMENT) && !block_cnt)
 		goto invalid;
 
 	/* data[] = receiver_id[N] access[N] block_high[M] block_low[M] */
@@ -248,7 +294,8 @@ int rpmi_tee_parcel_create(void *msgbuf, u32 msg_len,
 		return SBI_OK;
 	}
 
-	p->state = RPMI_PARCEL_CREATED;
+	p->state = (flags & RPMI_TEE_PARCEL_CREATE_FLAG_MULTI_SEGMENT) ?
+		   RPMI_PARCEL_CONSTRUCTING : RPMI_PARCEL_CREATED;
 	p->id = parcel_make_id(slot, p->gen);
 	p->creator_id = creator_id;
 	p->creator_access = creator_access;
@@ -273,6 +320,7 @@ int rpmi_tee_parcel_create(void *msgbuf, u32 msg_len,
 		p->blocks[i].page_count = RPMI_TEE_PARCEL_BLOCK_PAGES(low);
 	}
 	p->total_pages = total_pages;
+	p->next_segment_idx = 0;
 
 	resp->status = cpu_to_le32(RPMI_SUCCESS);
 	resp->mem_parcel_id = cpu_to_le32(p->id);
@@ -319,6 +367,7 @@ int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
 	u32 id, acceptor_id, access, nonce, creator_id, creator_access;
 	u32 flags, max_pages, other_cnt, expected, resp_bytes, i;
 	struct rpmi_parcel *p;
+	bool segmented = false;
 	int idx;
 
 	if (resp_max_len < sizeof(*resp))
@@ -391,41 +440,66 @@ int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
 	}
 
 	/*
-	 * Variable-length response: fixed header + block_high[K] block_low[K].
-	 * resp_max_len is checked against the real size before writing.
+	 * Variable-length response: fixed header + block_high[K] block_low[K],
+	 * where K is as many blocks as fit in resp_max_len. If the parcel has
+	 * more blocks than fit, set the MULTI_SEGMENT response flag; the
+	 * acceptor then pulls the remainder via SEGMENT_RECEIVE. block_cnt here
+	 * counts the blocks returned in THIS response (equal to the total in the
+	 * common single-response case, so existing single-shot readers are
+	 * unaffected).
 	 */
-	resp_bytes = sizeof(*resp) + 2 * p->block_cnt * sizeof(u32);
-	if (resp_bytes > resp_max_len) {
-		spin_unlock(&parcel_lock);
-		return parcel_accept_error(resp, resp_len,
-					   RPMI_ERR_INVALID_PARAM);
-	}
+	{
+	u32 max_fit = (resp_max_len - sizeof(*resp)) / (2 * sizeof(u32));
+	u32 ret_blocks = p->block_cnt;
+	bool more = false;
 
-	for (i = 0; i < p->block_cnt; i++) {
+	if (ret_blocks > max_fit) {
+		ret_blocks = max_fit;
+		more = true;
+	}
+	resp_bytes = sizeof(*resp) + 2 * ret_blocks * sizeof(u32);
+
+	for (i = 0; i < ret_blocks; i++) {
 		u64 page = p->blocks[i].base >> 12;
 		u32 pages = p->blocks[i].page_count;
 		u32 high = (u32)(page >> 20);
 		u32 low = (u32)(((page & 0xFFFFFU) << 12) | (pages - 1));
 
 		resp->data[i] = cpu_to_le32(high);
-		resp->data[p->block_cnt + i] = cpu_to_le32(low);
+		resp->data[ret_blocks + i] = cpu_to_le32(low);
 	}
 
 	p->accepted[idx] = true;
 	p->state = RPMI_PARCEL_ACCEPTED;
+	/*
+	 * Reset the shared SEGMENT_RECEIVE cursor for this accept. One cursor
+	 * (not per-acceptor) is sufficient: the block list is shared/immutable
+	 * and nothing in this design has multiple acceptors pulling segments
+	 * from the same parcel concurrently.
+	 */
+	p->next_receive_idx = 0;
 
 	resp->status = cpu_to_le32(RPMI_SUCCESS);
-	resp->flags = 0;
+	resp->flags = more ?
+		cpu_to_le32(RPMI_TEE_PARCEL_ACCEPT_RESP_FLAG_MULTI_SEGMENT) : 0;
 	resp->page_cnt = cpu_to_le32((u32)p->total_pages);
-	resp->block_cnt = cpu_to_le32(p->block_cnt);
+	resp->block_cnt = cpu_to_le32(ret_blocks);
 	*resp_len = resp_bytes;
+	segmented = more;
+	}
 
 	/*
 	 * Owner-transfer (donate): ownership moves to the acceptor, so the
 	 * creator can never reclaim it. Destroy the handle on accept; a later
 	 * reclaim of the same id then fails lookup.
+	 *
+	 * If the block list did not fit in this response (segmented accept),
+	 * the acceptor must still pull the remainder via SEGMENT_RECEIVE, so
+	 * the parcel has to survive until the LAST segment is delivered. In
+	 * that case defer the destroy to SEGMENT_RECEIVE; destroying here would
+	 * make the follow-up SEGMENT_RECEIVE fail lookup and strand the accept.
 	 */
-	if (p->flags & RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER) {
+	if ((p->flags & RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER) && !segmented) {
 		p->state = RPMI_PARCEL_DESTROYED;
 		parcel_recycle(p);
 	}
@@ -552,5 +626,199 @@ int rpmi_tee_parcel_reclaim(void *msgbuf, u32 msg_len,
 	resp->status = cpu_to_le32(RPMI_SUCCESS);
 	resp->flags = 0;
 	*resp_len = sizeof(*resp);
+	return SBI_OK;
+}
+
+/*
+ * SEGMENT_SEND (0x0D): the REE streams the remaining block-list segments of a
+ * MULTI_SEGMENT parcel still under construction. Each carries up to
+ * RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS blocks so the request stays within the
+ * transport slot; ordering is enforced implicitly by appending at the
+ * server's own next_segment_idx cursor (the spec carries no segment index on
+ * the wire). The LAST-flagged segment finalizes the parcel to CREATED.
+ * data[] = block_high[block_cnt] block_low[block_cnt].
+ */
+int rpmi_tee_parcel_segment_send(void *msgbuf, u32 msg_len,
+				 void *respbuf, u32 resp_max_len,
+				 unsigned long *resp_len)
+{
+	struct rpmi_tee_mem_parcel_segment_send_req *req = msgbuf;
+	struct rpmi_tee_mem_parcel_segment_send_resp *resp = respbuf;
+	u32 id, flags, block_cnt, expected;
+	const u32 *blk_high, *blk_low;
+	struct rpmi_parcel *p;
+	int rc;
+
+	if (resp_max_len < sizeof(*resp))
+		return SBI_ENOMEM;
+
+	if (msg_len < sizeof(*req)) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	id = le32_to_cpu(req->mem_parcel_id);
+	flags = le32_to_cpu(req->flags);
+	block_cnt = le32_to_cpu(req->block_cnt);
+
+	if (block_cnt > RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	/* data[] = block_high[block_cnt] block_low[block_cnt] */
+	expected = sizeof(*req) + 2 * block_cnt * sizeof(u32);
+	if (msg_len < expected) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	blk_high = &req->data[0];
+	blk_low = &req->data[block_cnt];
+
+	spin_lock(&parcel_lock);
+	p = parcel_lookup(id);
+	if (!p || p->state != RPMI_PARCEL_CONSTRUCTING) {
+		spin_unlock(&parcel_lock);
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_STATE);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	rc = parcel_append_blocks(p, blk_high, blk_low, block_cnt);
+	if (rc != RPMI_SUCCESS) {
+		spin_unlock(&parcel_lock);
+		resp->status = cpu_to_le32(rc);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	p->next_segment_idx++;
+
+	/* LAST finalizes: a MULTI_SEGMENT parcel must end with >=1 block. */
+	if (flags & RPMI_TEE_PARCEL_SEGMENT_FLAG_LAST) {
+		if (!p->block_cnt) {
+			spin_unlock(&parcel_lock);
+			resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+			*resp_len = sizeof(*resp);
+			return SBI_OK;
+		}
+		p->state = RPMI_PARCEL_CREATED;
+	}
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
+	*resp_len = sizeof(*resp);
+	spin_unlock(&parcel_lock);
+	return SBI_OK;
+}
+
+/*
+ * SEGMENT_RECEIVE (0x0E): an acceptor pulls the block list back in segments
+ * when it did not fit in the ACCEPT response. The server tracks the receive
+ * cursor itself (p->next_receive_idx, reset on ACCEPT); the acceptor supplies
+ * only its identity, which must match a registered, already-accepted
+ * receiver of this parcel. Each call returns as many blocks as fit in the
+ * response, setting the LAST flag once the final block is included.
+ * data[] = block_high[block_cnt] block_low[block_cnt].
+ */
+int rpmi_tee_parcel_segment_receive(void *msgbuf, u32 msg_len,
+				    void *respbuf, u32 resp_max_len,
+				    unsigned long *resp_len)
+{
+	struct rpmi_tee_mem_parcel_segment_receive_req *req = msgbuf;
+	struct rpmi_tee_mem_parcel_segment_receive_resp *resp = respbuf;
+	u32 id, acceptor_id, max_fit, ret_blocks, i;
+	struct rpmi_parcel *p;
+	int idx;
+
+	if (resp_max_len < sizeof(*resp))
+		return SBI_ENOMEM;
+
+	if (msg_len < sizeof(*req)) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		resp->flags = 0;
+		resp->block_cnt = 0;
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	id = le32_to_cpu(req->mem_parcel_id);
+	acceptor_id = le32_to_cpu(req->acceptor_id);
+
+	spin_lock(&parcel_lock);
+	p = parcel_lookup(id);
+	if (!p || (p->state != RPMI_PARCEL_CREATED &&
+		   p->state != RPMI_PARCEL_ACCEPTED)) {
+		spin_unlock(&parcel_lock);
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_STATE);
+		resp->flags = 0;
+		resp->block_cnt = 0;
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	/* The acceptor must be a listed, already-accepted receiver. */
+	idx = parcel_receiver_index(p, acceptor_id);
+	if (idx < 0 || !p->accepted[idx]) {
+		spin_unlock(&parcel_lock);
+		resp->status = cpu_to_le32(RPMI_ERR_DENIED);
+		resp->flags = 0;
+		resp->block_cnt = 0;
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	if (p->next_receive_idx >= p->block_cnt) {
+		spin_unlock(&parcel_lock);
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		resp->flags = 0;
+		resp->block_cnt = 0;
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	max_fit = (resp_max_len - sizeof(*resp)) / (2 * sizeof(u32));
+	if (max_fit > RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS)
+		max_fit = RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS;
+	ret_blocks = p->block_cnt - p->next_receive_idx;
+	if (ret_blocks > max_fit)
+		ret_blocks = max_fit;
+
+	for (i = 0; i < ret_blocks; i++) {
+		u64 page = p->blocks[p->next_receive_idx + i].base >> 12;
+		u32 pages = p->blocks[p->next_receive_idx + i].page_count;
+		u32 high = (u32)(page >> 20);
+		u32 low = (u32)(((page & 0xFFFFFU) << 12) | (pages - 1));
+
+		resp->data[i] = cpu_to_le32(high);
+		resp->data[ret_blocks + i] = cpu_to_le32(low);
+	}
+
+	p->next_receive_idx += ret_blocks;
+
+	{
+	bool last = (p->next_receive_idx >= p->block_cnt);
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
+	resp->flags = last ?
+		cpu_to_le32(RPMI_TEE_PARCEL_SEGMENT_FLAG_LAST) : 0;
+	resp->block_cnt = cpu_to_le32(ret_blocks);
+	*resp_len = sizeof(*resp) + 2 * ret_blocks * sizeof(u32);
+
+	/*
+	 * A donate parcel's destroy was deferred by ACCEPT when its block list
+	 * had to be segmented (see rpmi_tee_parcel_accept). Ownership has now
+	 * fully transferred once the acceptor pulls the LAST segment, so retire
+	 * the handle here; a later reclaim of the same id then fails lookup.
+	 */
+	if (last && (p->flags & RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER)) {
+		p->state = RPMI_PARCEL_DESTROYED;
+		parcel_recycle(p);
+	}
+	}
+	spin_unlock(&parcel_lock);
 	return SBI_OK;
 }

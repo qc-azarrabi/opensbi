@@ -41,4 +41,12 @@ int rpmi_tee_parcel_reclaim(void *msgbuf, u32 msg_len,
 			    void *respbuf, u32 resp_max_len,
 			    unsigned long *resp_len);
 
+int rpmi_tee_parcel_segment_send(void *msgbuf, u32 msg_len,
+				 void *respbuf, u32 resp_max_len,
+				 unsigned long *resp_len);
+
+int rpmi_tee_parcel_segment_receive(void *msgbuf, u32 msg_len,
+				    void *respbuf, u32 resp_max_len,
+				    unsigned long *resp_len);
+
 #endif /* __RPMI_TEE_PARCEL_H__ */

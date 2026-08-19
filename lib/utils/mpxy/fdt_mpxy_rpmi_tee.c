@@ -122,12 +122,12 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 		case RPMI_TEE_FEAT_MEMORY_DONATE:
 		case RPMI_TEE_FEAT_MEMORY_LEND:
 		case RPMI_TEE_FEAT_MEMORY_SHARE:
+		case RPMI_TEE_FEAT_MULTISEGMENT_OPS:
 			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
 			feat_resp->value =
 				cpu_to_le32(RPMI_TEE_FEAT_VAL_FULL_REE_TEE);
 			break;
 		case RPMI_TEE_FEAT_SIGNAL_BUS:
-		case RPMI_TEE_FEAT_MULTISEGMENT_OPS:
 		case RPMI_TEE_FEAT_SYSINFO_FORMAT:
 			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
 			feat_resp->value = cpu_to_le32(RPMI_TEE_FEAT_VAL_NONE);
@@ -257,6 +257,16 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 	case RPMI_TEE_SRV_MEM_PARCEL_RECLAIM:
 		rc = rpmi_tee_parcel_reclaim(msgbuf, msg_len, respbuf,
 					     resp_max_len, resp_len);
+		break;
+
+	case RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_SEND:
+		rc = rpmi_tee_parcel_segment_send(msgbuf, msg_len, respbuf,
+						  resp_max_len, resp_len);
+		break;
+
+	case RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_RECEIVE:
+		rc = rpmi_tee_parcel_segment_receive(msgbuf, msg_len, respbuf,
+						     resp_max_len, resp_len);
 		break;
 
 	default:

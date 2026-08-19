@@ -996,6 +996,8 @@ enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
 	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
 	RPMI_TEE_SRV_MEM_PARCEL_RECLAIM = 0x0C,
+	RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_SEND = 0x0D,
+	RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_RECEIVE = 0x0E,
 	RPMI_TEE_SRV_TEE_CALL = 0x13,
 	RPMI_TEE_SRV_MAX_COUNT,
 };
@@ -1042,7 +1044,7 @@ enum rpmi_tee_impl_id {
  * A single static REE endpoint invokes a single static OP-TEE endpoint.
  */
 #define RPMI_TEE_ENDPOINT_REE		0
-#define RPMI_TEE_ENDPOINT_OPTEE	1
+#define RPMI_TEE_ENDPOINT_OPTEE		1
 
 /**
  * Well-known SERVICE UUID identifying the "OP-TEE communicate" service whose
@@ -1196,6 +1198,47 @@ struct rpmi_tee_mem_parcel_reclaim_req {
 struct rpmi_tee_mem_parcel_reclaim_resp {
 	s32 status;
 	u32 flags;
+};
+
+/*
+ * SEGMENT_SEND (0x0D) / SEGMENT_RECEIVE (0x0E): stream a parcel block list that
+ * does not fit a single RPMI message. The transport slot bounds each message to
+ * RPMI_MSG_DATA_SIZE(RPMI_SLOT_SIZE_MIN) bytes, so a block list wider than one
+ * message is split into fixed-cap segments carried by these two services.
+ *
+ * SEGMENT_SEND appends block-list segments to a parcel created with the
+ * MULTI_SEGMENT flag (state "constructing"); the segment carrying the LAST flag
+ * finalizes the parcel to the created state. SEGMENT_RECEIVE lets an acceptor
+ * pull the block list back in segments after an ACCEPT whose response set the
+ * MULTI_SEGMENT flag (i.e. could not return every block in one response).
+ */
+#define RPMI_TEE_PARCEL_SEGMENT_FLAG_LAST	(1U << 31)
+#define RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS	4
+
+/* SEGMENT_SEND request: header + block_high[block_cnt] block_low[block_cnt]. */
+struct rpmi_tee_mem_parcel_segment_send_req {
+	u32 mem_parcel_id;
+	u32 flags;
+	u32 block_cnt;
+	u32 data[];
+};
+
+struct rpmi_tee_mem_parcel_segment_send_resp {
+	s32 status;
+};
+
+/* SEGMENT_RECEIVE request: pull the next segment for an in-progress accept. */
+struct rpmi_tee_mem_parcel_segment_receive_req {
+	u32 acceptor_id;
+	u32 mem_parcel_id;
+};
+
+/* SEGMENT_RECEIVE response: header + block_high[block_cnt] block_low[block_cnt]. */
+struct rpmi_tee_mem_parcel_segment_receive_resp {
+	s32 status;
+	u32 flags;
+	u32 block_cnt;
+	u32 data[];
 };
 
 /** RPMI Request Forward ServiceGroup Service IDs */
