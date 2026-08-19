@@ -822,3 +822,114 @@ int rpmi_tee_parcel_segment_receive(void *msgbuf, u32 msg_len,
 	spin_unlock(&parcel_lock);
 	return SBI_OK;
 }
+
+/*
+ * Minimal CBOR encoder for the fixed PROBE_SYSTEM system-info map. Only the
+ * subset needed here is implemented: short definite-length maps, short
+ * text-string keys, and unsigned integers. Each helper appends to buf[] at
+ * *off, never writing past cap; on overflow it keeps advancing *off so the
+ * caller can detect truncation by comparing the returned length against cap.
+ * No general CBOR support is intended.
+ */
+static void cbor_put(u8 *buf, u32 cap, u32 *off, u8 b)
+{
+	if (*off < cap)
+		buf[*off] = b;
+	(*off)++;
+}
+
+/* CBOR unsigned integer (major type 0). */
+static void cbor_uint(u8 *buf, u32 cap, u32 *off, u32 v)
+{
+	if (v < 24) {
+		cbor_put(buf, cap, off, (u8)v);
+	} else if (v < 256) {
+		cbor_put(buf, cap, off, 0x18);
+		cbor_put(buf, cap, off, (u8)v);
+	} else if (v < 65536) {
+		cbor_put(buf, cap, off, 0x19);
+		cbor_put(buf, cap, off, (u8)(v >> 8));
+		cbor_put(buf, cap, off, (u8)v);
+	} else {
+		cbor_put(buf, cap, off, 0x1a);
+		cbor_put(buf, cap, off, (u8)(v >> 24));
+		cbor_put(buf, cap, off, (u8)(v >> 16));
+		cbor_put(buf, cap, off, (u8)(v >> 8));
+		cbor_put(buf, cap, off, (u8)v);
+	}
+}
+
+/* CBOR map header (major type 5) for n <= 23 pairs. */
+static void cbor_map(u8 *buf, u32 cap, u32 *off, u32 n)
+{
+	cbor_put(buf, cap, off, (u8)(0xa0 | (n & 0x1f)));
+}
+
+/* CBOR text string (major type 3) for a short (< 24 byte) ASCII key. */
+static void cbor_key(u8 *buf, u32 cap, u32 *off, const char *s)
+{
+	u32 i, len = 0;
+
+	while (s[len])
+		len++;
+	cbor_put(buf, cap, off, (u8)(0x60 | (len & 0x1f)));
+	for (i = 0; i < len; i++)
+		cbor_put(buf, cap, off, (u8)s[i]);
+}
+
+/*
+ * Encode the parcel-manager system-info map into buf[] and return its encoded
+ * length (which may exceed cap if it did not fit). The map advertises the
+ * framework's fixed parcel capacities and supported modes so a discovering REE
+ * need not hard-code them.
+ */
+static u32 parcel_encode_system_info(u8 *buf, u32 cap)
+{
+	u32 off = 0;
+
+	cbor_map(buf, cap, &off, 5);
+	cbor_key(buf, cap, &off, "pool_size");
+	cbor_uint(buf, cap, &off, RPMI_PARCEL_POOL_SIZE);
+	cbor_key(buf, cap, &off, "max_receivers");
+	cbor_uint(buf, cap, &off, RPMI_PARCEL_MAX_RECEIVERS);
+	cbor_key(buf, cap, &off, "max_blocks");
+	cbor_uint(buf, cap, &off, RPMI_PARCEL_MAX_BLOCKS);
+	cbor_key(buf, cap, &off, "seg_max_blocks");
+	cbor_uint(buf, cap, &off, RPMI_TEE_PARCEL_SEGMENT_MAX_BLOCKS);
+	/* modes bitmask: donate(1) | lend(2) | share(4). */
+	cbor_key(buf, cap, &off, "modes");
+	cbor_uint(buf, cap, &off, 0x7);
+
+	return off;
+}
+
+/*
+ * PROBE_SYSTEM (0x03): return a CBOR-encoded system-info blob describing the
+ * parcel-manager capacities. Framework-answered; no TEE domain involvement.
+ * The response carries the encoding format and the blob inline after the
+ * fixed header.
+ */
+int rpmi_tee_parcel_probe_system(void *msgbuf, u32 msg_len,
+				 void *respbuf, u32 resp_max_len,
+				 unsigned long *resp_len)
+{
+	struct rpmi_tee_probe_system_resp *resp = respbuf;
+	u32 cap, info_len;
+
+	(void)msgbuf;
+	(void)msg_len;
+
+	if (resp_max_len < sizeof(*resp))
+		return SBI_ENOMEM;
+
+	cap = resp_max_len - sizeof(*resp);
+	info_len = parcel_encode_system_info(resp->data, cap);
+	if (info_len > cap)
+		return SBI_ENOMEM;
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
+	resp->format = cpu_to_le32(RPMI_TEE_SYSINFO_FORMAT_CBOR);
+	resp->info_len = cpu_to_le32(info_len);
+	*resp_len = sizeof(*resp) + info_len;
+	return SBI_OK;
+}

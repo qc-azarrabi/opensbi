@@ -992,6 +992,7 @@ struct rpmi_mm_communicate_rsp {
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
+	RPMI_TEE_SRV_PROBE_SYSTEM = 0x03,
 	RPMI_TEE_SRV_MEM_PARCEL_CREATE = 0x09,
 	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
 	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
@@ -1026,6 +1027,30 @@ struct rpmi_tee_probe_features_req {
 struct rpmi_tee_probe_features_resp {
 	s32 status;
 	u32 value;
+};
+
+/*
+ * SYSINFO_FORMAT values reported by TEE_PROBE_FEATURES for the SYSINFO_FORMAT
+ * feature: the encoding used by the PROBE_SYSTEM system-info blob. 0 = none.
+ */
+#define RPMI_TEE_SYSINFO_FORMAT_NONE	0
+#define RPMI_TEE_SYSINFO_FORMAT_CBOR	1
+
+/** TEE_PROBE_SYSTEM request (no parameters) */
+struct rpmi_tee_probe_system_req {
+	u32 reserved;
+};
+
+/*
+ * TEE_PROBE_SYSTEM response: fixed header + a variable-length system-info blob
+ * encoded per the SYSINFO_FORMAT feature value (CBOR here). info_len is the
+ * number of valid bytes in data[]; format echoes the encoding.
+ */
+struct rpmi_tee_probe_system_resp {
+	s32 status;
+	u32 format;
+	u32 info_len;
+	u8 data[];
 };
 
 /** TEE Implementation IDs */

@@ -128,9 +128,18 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 				cpu_to_le32(RPMI_TEE_FEAT_VAL_FULL_REE_TEE);
 			break;
 		case RPMI_TEE_FEAT_SIGNAL_BUS:
-		case RPMI_TEE_FEAT_SYSINFO_FORMAT:
 			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
 			feat_resp->value = cpu_to_le32(RPMI_TEE_FEAT_VAL_NONE);
+			break;
+		case RPMI_TEE_FEAT_SYSINFO_FORMAT:
+			/*
+			 * SYSINFO_FORMAT's value is the encoding format of the
+			 * PROBE_SYSTEM blob, not a REE/TEE support level. We
+			 * emit CBOR.
+			 */
+			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
+			feat_resp->value =
+				cpu_to_le32(RPMI_TEE_SYSINFO_FORMAT_CBOR);
 			break;
 		default:
 			feat_resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
@@ -267,6 +276,11 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 	case RPMI_TEE_SRV_MEM_PARCEL_SEGMENT_RECEIVE:
 		rc = rpmi_tee_parcel_segment_receive(msgbuf, msg_len, respbuf,
 						     resp_max_len, resp_len);
+		break;
+
+	case RPMI_TEE_SRV_PROBE_SYSTEM:
+		rc = rpmi_tee_parcel_probe_system(msgbuf, msg_len, respbuf,
+						  resp_max_len, resp_len);
 		break;
 
 	default:
