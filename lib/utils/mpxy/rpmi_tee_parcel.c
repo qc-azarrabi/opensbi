@@ -66,7 +66,6 @@ struct rpmi_parcel {
 static struct rpmi_parcel parcel_pool[RPMI_PARCEL_POOL_SIZE];
 static DEFINE_SPIN_LOCK(parcel_lock);
 static bool parcel_pool_ready;
-
 void rpmi_tee_parcel_init(void)
 {
 	int i;
@@ -81,7 +80,6 @@ void rpmi_tee_parcel_init(void)
 		sbi_memset(&parcel_pool[i], 0, sizeof(parcel_pool[i]));
 		parcel_pool[i].state = RPMI_PARCEL_FREE;
 	}
-
 	parcel_pool_ready = true;
 	spin_unlock(&parcel_lock);
 }
@@ -105,7 +103,6 @@ static struct rpmi_parcel *parcel_lookup(u32 id)
 	slot = id & 0xff;
 	if (slot >= RPMI_PARCEL_POOL_SIZE)
 		return NULL;
-
 	if (parcel_pool[slot].state == RPMI_PARCEL_FREE ||
 	    parcel_pool[slot].id != id)
 		return NULL;
@@ -346,6 +343,21 @@ static int parcel_receiver_index(const struct rpmi_parcel *p, u32 endpoint_id)
 	return -1;
 }
 
+/* Per-parcel physical isolation - grant/revoke hooks (deliberate no-op here). */
+static int parcel_isolation_grant(const struct rpmi_parcel *p, u32 receiver_id)
+{
+	(void)p;
+	(void)receiver_id;
+
+	return SBI_OK;
+}
+
+static void parcel_isolation_revoke(const struct rpmi_parcel *p, u32 receiver_id)
+{
+	(void)p;
+	(void)receiver_id;
+}
+
 /* Fill a fixed-header ACCEPT error response; always returns SBI_OK. */
 static int parcel_accept_error(struct rpmi_tee_mem_parcel_accept_resp *resp,
 			       unsigned long *resp_len, u32 status)
@@ -479,6 +491,12 @@ int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
 	 */
 	p->next_receive_idx = 0;
 
+	/*
+	 * Grant the acceptor physical access to the parcel blocks. No-op in
+	 * this build; see the isolation design note above parcel_accept.
+	 */
+	parcel_isolation_grant(p, p->receiver_id[idx]);
+
 	resp->status = cpu_to_le32(RPMI_SUCCESS);
 	resp->flags = more ?
 		cpu_to_le32(RPMI_TEE_PARCEL_ACCEPT_RESP_FLAG_MULTI_SEGMENT) : 0;
@@ -569,6 +587,11 @@ int rpmi_tee_parcel_release(void *msgbuf, u32 msg_len,
 		int idx = parcel_receiver_index(p, ep);
 
 		p->released[idx] = true;
+		/*
+		 * Revoke the endpoint's granted access. No-op in this build;
+		 * see the isolation design note above parcel_accept.
+		 */
+		parcel_isolation_revoke(p, ep);
 	}
 
 	if (parcel_all_released(p))
