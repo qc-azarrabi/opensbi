@@ -287,16 +287,22 @@ invalid:
 	return SBI_OK;
 }
 
-int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
-			   void *respbuf, u32 resp_max_len,
-			   unsigned long *resp_len)
+/* Find a receiver slot by endpoint id; returns index or -1 if not listed. */
+static int parcel_receiver_index(const struct rpmi_parcel *p, u32 endpoint_id)
 {
-	struct rpmi_tee_mem_parcel_accept_resp *resp = respbuf;
+	u32 i;
 
-	if (resp_max_len < sizeof(*resp))
-		return SBI_ENOMEM;
+	for (i = 0; i < p->receiver_cnt; i++)
+		if (p->receiver_id[i] == endpoint_id)
+			return (int)i;
+	return -1;
+}
 
-	resp->status = cpu_to_le32(RPMI_ERR_NOTSUPP);
+/* Fill a fixed-header ACCEPT error response; always returns SBI_OK. */
+static int parcel_accept_error(struct rpmi_tee_mem_parcel_accept_resp *resp,
+			       unsigned long *resp_len, u32 status)
+{
+	resp->status = cpu_to_le32(status);
 	resp->flags = 0;
 	resp->page_cnt = 0;
 	resp->block_cnt = 0;
@@ -304,17 +310,189 @@ int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
 	return SBI_OK;
 }
 
-int rpmi_tee_parcel_release(void *msgbuf, u32 msg_len,
-			    void *respbuf, u32 resp_max_len,
-			    unsigned long *resp_len)
+int rpmi_tee_parcel_accept(void *msgbuf, u32 msg_len,
+			   void *respbuf, u32 resp_max_len,
+			   unsigned long *resp_len)
 {
-	struct rpmi_tee_mem_parcel_release_resp *resp = respbuf;
+	struct rpmi_tee_mem_parcel_accept_req *req = msgbuf;
+	struct rpmi_tee_mem_parcel_accept_resp *resp = respbuf;
+	u32 id, acceptor_id, access, nonce, creator_id, creator_access;
+	u32 flags, max_pages, other_cnt, expected, resp_bytes, i;
+	struct rpmi_parcel *p;
+	int idx;
 
 	if (resp_max_len < sizeof(*resp))
 		return SBI_ENOMEM;
 
-	resp->status = cpu_to_le32(RPMI_ERR_NOTSUPP);
+	if (msg_len < sizeof(*req))
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+
+	acceptor_id = le32_to_cpu(req->acceptor_id);
+	access = le32_to_cpu(req->access) & RPMI_TEE_PARCEL_ACCESS_MASK;
+	id = le32_to_cpu(req->mem_parcel_id);
+	nonce = le32_to_cpu(req->nonce);
+	creator_id = le32_to_cpu(req->creator_id);
+	creator_access = le32_to_cpu(req->creator_access);
+	flags = le32_to_cpu(req->flags);
+	max_pages = le32_to_cpu(req->max_pages);
+	other_cnt = le32_to_cpu(req->other_cnt);
+
+	/* Deferred multi-segment accept is rejected. */
+	if (flags & RPMI_TEE_PARCEL_ACCEPT_RESP_FLAG_MULTI_SEGMENT)
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+
+	if (other_cnt > RPMI_PARCEL_MAX_RECEIVERS)
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+
+	/* data[] = other_id[other_cnt] other_access[other_cnt] */
+	expected = sizeof(*req) + 2 * other_cnt * sizeof(u32);
+	if (msg_len < expected)
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+
+	spin_lock(&parcel_lock);
+	p = parcel_lookup(id);
+	if (!p || (p->state != RPMI_PARCEL_CREATED &&
+		   p->state != RPMI_PARCEL_ACCEPTED)) {
+		spin_unlock(&parcel_lock);
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+	}
+
+	/* The accept must match the parcel's creator identity and nonce. */
+	if (nonce != p->nonce || creator_id != p->creator_id ||
+	    creator_access != p->creator_access) {
+		spin_unlock(&parcel_lock);
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+	}
+
+	/* The acceptor must be a listed receiver. */
+	idx = parcel_receiver_index(p, acceptor_id);
+	if (idx < 0) {
+		spin_unlock(&parcel_lock);
+		return parcel_accept_error(resp, resp_len, RPMI_ERR_DENIED);
+	}
+
+	/* Requested access must be a subset of the receiver's grant. */
+	if (access & ~p->receiver_access[idx]) {
+		spin_unlock(&parcel_lock);
+		return parcel_accept_error(resp, resp_len, RPMI_ERR_DENIED);
+	}
+
+	/* The acceptor's advertised capacity must cover the parcel. */
+	if (max_pages && p->total_pages > max_pages) {
+		spin_unlock(&parcel_lock);
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+	}
+
+	/*
+	 * Variable-length response: fixed header + block_high[K] block_low[K].
+	 * resp_max_len is checked against the real size before writing.
+	 */
+	resp_bytes = sizeof(*resp) + 2 * p->block_cnt * sizeof(u32);
+	if (resp_bytes > resp_max_len) {
+		spin_unlock(&parcel_lock);
+		return parcel_accept_error(resp, resp_len,
+					   RPMI_ERR_INVALID_PARAM);
+	}
+
+	for (i = 0; i < p->block_cnt; i++) {
+		u64 page = p->blocks[i].base >> 12;
+		u32 pages = p->blocks[i].page_count;
+		u32 high = (u32)(page >> 20);
+		u32 low = (u32)(((page & 0xFFFFFU) << 12) | (pages - 1));
+
+		resp->data[i] = cpu_to_le32(high);
+		resp->data[p->block_cnt + i] = cpu_to_le32(low);
+	}
+
+	p->accepted[idx] = true;
+	p->state = RPMI_PARCEL_ACCEPTED;
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
+	resp->flags = 0;
+	resp->page_cnt = cpu_to_le32((u32)p->total_pages);
+	resp->block_cnt = cpu_to_le32(p->block_cnt);
+	*resp_len = resp_bytes;
+
+	spin_unlock(&parcel_lock);
+	return SBI_OK;
+}
+
+int rpmi_tee_parcel_release(void *msgbuf, u32 msg_len,
+			    void *respbuf, u32 resp_max_len,
+			    unsigned long *resp_len)
+{
+	struct rpmi_tee_mem_parcel_release_req *req = msgbuf;
+	struct rpmi_tee_mem_parcel_release_resp *resp = respbuf;
+	u32 id, endpoint_cnt, expected, i;
+	struct rpmi_parcel *p;
+
+	if (resp_max_len < sizeof(*resp))
+		return SBI_ENOMEM;
+
+	if (msg_len < sizeof(*req)) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	id = le32_to_cpu(req->mem_parcel_id);
+	endpoint_cnt = le32_to_cpu(req->endpoint_cnt);
+
+	if (!endpoint_cnt || endpoint_cnt > RPMI_PARCEL_MAX_RECEIVERS) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	expected = sizeof(*req) + endpoint_cnt * sizeof(u32);
+	if (msg_len < expected) {
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	spin_lock(&parcel_lock);
+	p = parcel_lookup(id);
+	if (!p) {
+		spin_unlock(&parcel_lock);
+		resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+		*resp_len = sizeof(*resp);
+		return SBI_OK;
+	}
+
+	/* Every listed endpoint must currently hold an accepted, unreleased grant. */
+	for (i = 0; i < endpoint_cnt; i++) {
+		u32 ep = le32_to_cpu(req->endpoint_id[i]);
+		int idx = parcel_receiver_index(p, ep);
+
+		if (idx < 0 || !p->accepted[idx] || p->released[idx]) {
+			spin_unlock(&parcel_lock);
+			resp->status = cpu_to_le32(RPMI_ERR_INVALID_STATE);
+			*resp_len = sizeof(*resp);
+			return SBI_OK;
+		}
+	}
+
+	for (i = 0; i < endpoint_cnt; i++) {
+		u32 ep = le32_to_cpu(req->endpoint_id[i]);
+		int idx = parcel_receiver_index(p, ep);
+
+		p->released[idx] = true;
+	}
+
+	if (parcel_all_released(p))
+		p->state = RPMI_PARCEL_RELEASED;
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
 	*resp_len = sizeof(*resp);
+	spin_unlock(&parcel_lock);
 	return SBI_OK;
 }
 
