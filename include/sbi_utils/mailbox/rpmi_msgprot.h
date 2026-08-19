@@ -992,6 +992,10 @@ struct rpmi_mm_communicate_rsp {
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
+	RPMI_TEE_SRV_MEM_PARCEL_CREATE = 0x09,
+	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
+	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
+	RPMI_TEE_SRV_MEM_PARCEL_RECLAIM = 0x0C,
 	RPMI_TEE_SRV_TEE_CALL = 0x13,
 	RPMI_TEE_SRV_MAX_COUNT,
 };
@@ -1069,6 +1073,124 @@ struct rpmi_tee_get_attributes_resp {
 	u32 tee_impl_id;
 	u32 comm_req_regs;
 	u32 comm_resp_regs;
+};
+
+/*
+ * Memory parcel wire encodings (RPMI spec section 4.16, Tables 198-207).
+ *
+ * A memory parcel describes memory as a scatter-gather block list plus
+ * per-receiver access rights. All fields are little-endian uint32 words on the
+ * wire. Addresses in the block list are expressed in units of 4kB pages, not
+ * bytes.
+ */
+
+/* Memory access encoding (Table 199) */
+#define RPMI_TEE_PARCEL_ACCESS_R	(1U << 29)
+#define RPMI_TEE_PARCEL_ACCESS_W	(1U << 30)
+#define RPMI_TEE_PARCEL_ACCESS_X	(1U << 31)
+#define RPMI_TEE_PARCEL_ACCESS_MASK	(RPMI_TEE_PARCEL_ACCESS_R | \
+					 RPMI_TEE_PARCEL_ACCESS_W | \
+					 RPMI_TEE_PARCEL_ACCESS_X)
+
+/* MEM_PARCEL_CREATE FLAGS (Table 200) */
+#define RPMI_TEE_PARCEL_CREATE_FLAG_MULTI_SEGMENT	(1U << 31)
+#define RPMI_TEE_PARCEL_CREATE_FLAG_OWNER_XFER		(1U << 30)
+
+/* MEM_PARCEL_ACCEPT response FLAGS (Table 203) */
+#define RPMI_TEE_PARCEL_ACCEPT_RESP_FLAG_MULTI_SEGMENT	(1U << 31)
+
+/* MEM_PARCEL_RECLAIM response FLAGS (Table 207) */
+#define RPMI_TEE_PARCEL_RECLAIM_RESP_FLAG_ZEROED	(1U << 31)
+
+/*
+ * Block list encoding (Table 198): addresses are in 4kB page units.
+ *   page number = (BLOCK_HIGH << 20) | (BLOCK_LOW >> 12)
+ *   page count  = (BLOCK_LOW & 0xFFF) + 1   (range 1..4096)
+ */
+#define RPMI_TEE_PARCEL_BLOCK_PAGES(low)	(((low) & 0xFFFU) + 1)
+#define RPMI_TEE_PARCEL_BLOCK_PAGE_NUM(high, low) \
+	(((u64)(u32)(high) << 20) | ((u32)(low) >> 12))
+#define RPMI_TEE_PARCEL_BLOCK_LABEL_LEN		16
+
+/*
+ * MEM_PARCEL_CREATE request (Table 200). Fixed header, then four back-to-back
+ * variable-length uint32 arrays accessed via computed offsets into data[]:
+ *   receiver_id[receiver_cnt];
+ *   access[receiver_cnt];
+ *   block_high[block_cnt];
+ *   block_low[block_cnt];
+ */
+struct rpmi_tee_mem_parcel_create_req {
+	u32 creator_id;
+	u32 creator_access;
+	u32 receiver_cnt;
+	u32 flags;
+	u32 nonce;
+	u32 block_cnt;
+	u8 label[RPMI_TEE_PARCEL_BLOCK_LABEL_LEN];
+	u32 data[];
+};
+
+struct rpmi_tee_mem_parcel_create_resp {
+	s32 status;
+	u32 mem_parcel_id;
+};
+
+/*
+ * MEM_PARCEL_ACCEPT request (Table 202). Fixed header, then two back-to-back
+ * variable-length uint32 arrays in data[]:
+ *   other_id[other_cnt];
+ *   other_access[other_cnt];
+ */
+struct rpmi_tee_mem_parcel_accept_req {
+	u32 acceptor_id;
+	u32 access;
+	u32 mem_parcel_id;
+	u32 nonce;
+	u32 creator_id;
+	u32 creator_access;
+	u32 flags;
+	u32 address_high;
+	u32 address_low;
+	u32 max_pages;
+	u32 other_cnt;
+	u32 data[];
+};
+
+/*
+ * MEM_PARCEL_ACCEPT response (Table 203). Fixed header, then the returned
+ * block list in data[]:
+ *   block_high[block_cnt];
+ *   block_low[block_cnt];
+ */
+struct rpmi_tee_mem_parcel_accept_resp {
+	s32 status;
+	u32 flags;
+	u32 page_cnt;
+	u32 block_cnt;
+	u32 data[];
+};
+
+/* MEM_PARCEL_RELEASE request (Table 204) */
+struct rpmi_tee_mem_parcel_release_req {
+	u32 mem_parcel_id;
+	u32 flags;
+	u32 endpoint_cnt;
+	u32 endpoint_id[];
+};
+
+struct rpmi_tee_mem_parcel_release_resp {
+	s32 status;
+};
+
+/* MEM_PARCEL_RECLAIM request (Table 206) */
+struct rpmi_tee_mem_parcel_reclaim_req {
+	u32 mem_parcel_id;
+};
+
+struct rpmi_tee_mem_parcel_reclaim_resp {
+	s32 status;
+	u32 flags;
 };
 
 /** RPMI Request Forward ServiceGroup Service IDs */
