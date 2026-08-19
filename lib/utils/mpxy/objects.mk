@@ -35,3 +35,4 @@ libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_REQFWD) += mpxy/fdt_mpxy_rpmi_reqfwd.o
 
 carray-fdt_mpxy_drivers-$(CONFIG_FDT_MPXY_RPMI_TEE) += fdt_mpxy_rpmi_tee
 libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_TEE) += mpxy/fdt_mpxy_rpmi_tee.o
+libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_TEE) += mpxy/rpmi_tee_parcel.o

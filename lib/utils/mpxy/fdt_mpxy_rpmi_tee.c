@@ -19,6 +19,7 @@
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_mbox.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_tee.h>
+#include <sbi_utils/mpxy/rpmi_tee_parcel.h>
 #include <sbi_utils/mailbox/rpmi_mailbox.h>
 
 /**
@@ -238,6 +239,26 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 		break;
 	}
 
+	case RPMI_TEE_SRV_MEM_PARCEL_CREATE:
+		rc = rpmi_tee_parcel_create(msgbuf, msg_len, respbuf,
+					    resp_max_len, resp_len);
+		break;
+
+	case RPMI_TEE_SRV_MEM_PARCEL_ACCEPT:
+		rc = rpmi_tee_parcel_accept(msgbuf, msg_len, respbuf,
+					    resp_max_len, resp_len);
+		break;
+
+	case RPMI_TEE_SRV_MEM_PARCEL_RELEASE:
+		rc = rpmi_tee_parcel_release(msgbuf, msg_len, respbuf,
+					     resp_max_len, resp_len);
+		break;
+
+	case RPMI_TEE_SRV_MEM_PARCEL_RECLAIM:
+		rc = rpmi_tee_parcel_reclaim(msgbuf, msg_len, respbuf,
+					     resp_max_len, resp_len);
+		break;
+
 	default:
 		*status = cpu_to_le32(RPMI_ERR_NOTSUPP);
 		*resp_len = sizeof(u32);
@@ -309,6 +330,9 @@ static int mpxy_tee_init(const void *fdt, int nodeoff,
 	tee = sbi_zalloc(sizeof(*tee));
 	if (!tee)
 		return SBI_ENOMEM;
+
+	/* Initialize the shared memory parcel pool (idempotent). */
+	rpmi_tee_parcel_init();
 
 	/* Get channel ID from DT */
 	val = fdt_getprop(fdt, nodeoff, "riscv,sbi-mpxy-channel-id", &len);
