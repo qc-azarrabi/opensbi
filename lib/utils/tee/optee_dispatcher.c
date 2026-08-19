@@ -145,7 +145,14 @@ static int optee_transform_response(void *tx, u32 tx_len,
 
 	/* Copy a1-a4 to rx, skipping a0 (TEEABI_OPTEED_RETURN_*) */
 	sbi_memcpy(rx, &(((ulong *)tx)[1]), copy_len);
-	*rx_len = copy_len;
+
+	/*
+	 * The TEE_CALL handler placed rx at call_resp->service_rsp, i.e. after
+	 * the fixed STATUS + SERVICE_RSP_LEN header. The REE measures the
+	 * response from the start of that header, so the reported length must
+	 * include it: sizeof(rpmi_tee_call_resp) + stripped register block.
+	 */
+	*rx_len = sizeof(struct rpmi_tee_call_resp) + copy_len;
 
 	return SBI_OK;
 }
@@ -187,9 +194,16 @@ static int optee_communicate(const struct tee_dispatcher *dispatcher,
 	if (!recv_channel)
 		return SBI_ENODEV;
 
-	/* Prepare the header for forwarding to OP-TEE domain */
+	/*
+	 * Prepare the header for forwarding to OP-TEE domain.
+	 *
+	 * OP-TEE reassembles the a0-a7 register block from the REQFWD payload
+	 * and never inspects this service_id, so these fields are cosmetic;
+	 * they are kept aligned with the REE-facing TEE_CALL (0x13) service for
+	 * traceability.
+	 */
 	header.servicegroup_id = cpu_to_le16(RPMI_SRVGRP_TEE);
-	header.service_id = RPMI_TEE_SRV_COMMUNICATE;
+	header.service_id = RPMI_TEE_SRV_TEE_CALL;
 	header.flags = RPMI_MSG_NORMAL_REQUEST;
 	header.datalen = cpu_to_le16(tx_len);
 	header.token = cpu_to_le16(0);

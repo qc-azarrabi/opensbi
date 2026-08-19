@@ -134,69 +134,103 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 		break;
 	}
 
-	case RPMI_TEE_SRV_COMMUNICATE:
+	case RPMI_TEE_SRV_TEE_CALL: {
 		/*
-		 * TEE_COMMUNICATE response format:
-		 *   Word 0:    STATUS (RPMI error code)
-		 *   Word 1..M: Implementation-specific data (XLEN-sized registers)
+		 * TEE_CALL (RPMI spec section 4.16, Tables 218/219).
 		 *
-		 * Reserve space for STATUS, pass remaining buffer to dispatcher.
-		 * The response data size is determined by comm_resp_regs from
-		 * TEE attributes (e.g., 4 registers for OP-TEE = 32 bytes on RV64).
+		 * The request carries a fixed REE->OP-TEE identity and a
+		 * well-known service UUID; its SERVICE_DATA is the SMC-style
+		 * a0-a7 register block. After validation the register block is
+		 * forwarded to the TEE dispatcher unchanged (identical to the
+		 * legacy COMMUNICATE payload), so OP-TEE needs no change.
+		 *
+		 * Response layout:
+		 *   Word 0: STATUS (s32)
+		 *   Word 1: SERVICE_RSP_LEN (u32)
+		 *   Bytes 8 .. M: SERVICE_RSP (comm_resp_regs XLEN-sized registers)
 		 */
-		if (resp_max_len < sizeof(s32)) {
+		static const u8 optee_service_uuid[16] =
+			RPMI_TEE_OPTEE_SERVICE_UUID;
+		struct rpmi_tee_call_req *call_req = msgbuf;
+		struct rpmi_tee_call_resp *call_resp = respbuf;
+		u32 service_data_len;
+
+		if (resp_max_len < sizeof(*call_resp)) {
 			rc = SBI_ENOMEM;
+			break;
+		}
+
+		/* Validate framing: header present, fixed identity + UUID */
+		if (msg_len < sizeof(*call_req) ||
+		    le32_to_cpu(call_req->sender_id) != RPMI_TEE_ENDPOINT_REE ||
+		    le32_to_cpu(call_req->target_id) != RPMI_TEE_ENDPOINT_OPTEE ||
+		    sbi_memcmp(call_req->service, optee_service_uuid,
+			       sizeof(optee_service_uuid))) {
+			call_resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+			call_resp->service_rsp_len = 0;
+			*resp_len = sizeof(*call_resp);
+			break;
+		}
+
+		service_data_len = le32_to_cpu(call_req->service_data_len);
+		if (!service_data_len ||
+		    service_data_len > msg_len - sizeof(*call_req)) {
+			call_resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);
+			call_resp->service_rsp_len = 0;
+			*resp_len = sizeof(*call_resp);
 			break;
 		}
 
 		if (tee->dispatcher->ops->communicate) {
 			unsigned long data_len = 0;
-			void *data_buf = (u8 *)respbuf + sizeof(u32);
-			u32 data_max_len = resp_max_len - sizeof(u32);
+			void *data_buf = call_resp->service_rsp;
+			u32 data_max_len = resp_max_len - sizeof(*call_resp);
+			u32 rsp_len = tee->attrs.comm_resp_regs *
+				      sizeof(unsigned long);
 
 			rc = tee->dispatcher->ops->communicate(
 				tee->dispatcher,
-				msgbuf, msg_len,
+				call_req->service_data, service_data_len,
 				data_buf, data_max_len,
 				&data_len);
-
-			/* Set RPMI status based on dispatcher result */
 			if (rc) {
-				*status = cpu_to_le32(RPMI_ERR_FAILED);
-				*resp_len = sizeof(s32);
-			} else {
-				/*
-				 * Enter TEE domain if supported. This blocks
-				 * until TEE processing completes and the domain
-				 * switches back. After this returns, the response
-				 * data has been written to data_buf by the reqfwd
-				 * COMPLETE_CURRENT_MESSAGE handler.
-				 */
-				if (tee->dispatcher->ops->domain_enter) {
-					rc = tee->dispatcher->ops->domain_enter(
-						tee->dispatcher);
-					if (rc) {
-						*status = cpu_to_le32(RPMI_ERR_FAILED);
-						*resp_len = sizeof(s32);
-						break;
-					}
-				}
-
-				*status = cpu_to_le32(RPMI_SUCCESS);
-				/*
-				 * data_len may be the REQFWD RETRIEVE
-				 * response length when resuming a waiting
-				 * OP-TEE domain.
-				 * It already includes the RPMI status/header.
-				 * Should not add the TEE status word here.
-				 */
-				*resp_len = data_len;
+				call_resp->status = cpu_to_le32(RPMI_ERR_FAILED);
+				call_resp->service_rsp_len = 0;
+				*resp_len = sizeof(*call_resp);
+				break;
 			}
+
+			/*
+			 * Enter TEE domain. Blocks until OP-TEE processing
+			 * completes and the domain switches back; the reqfwd
+			 * COMPLETE handler writes the stripped a0-a3 register
+			 * block into data_buf. The response register count is
+			 * fixed by the dispatcher (comm_resp_regs), so the
+			 * SERVICE_RSP length is deterministic and must NOT be
+			 * taken from the reqfwd retrieve length in data_len.
+			 */
+			if (tee->dispatcher->ops->domain_enter) {
+				rc = tee->dispatcher->ops->domain_enter(
+					tee->dispatcher);
+				if (rc) {
+					call_resp->status =
+						cpu_to_le32(RPMI_ERR_FAILED);
+					call_resp->service_rsp_len = 0;
+					*resp_len = sizeof(*call_resp);
+					break;
+				}
+			}
+
+			call_resp->status = cpu_to_le32(RPMI_SUCCESS);
+			call_resp->service_rsp_len = cpu_to_le32(rsp_len);
+			*resp_len = sizeof(*call_resp) + rsp_len;
 		} else {
-			*status = cpu_to_le32(RPMI_ERR_NOTSUPP);
-			*resp_len = sizeof(s32);
+			call_resp->status = cpu_to_le32(RPMI_ERR_NOTSUPP);
+			call_resp->service_rsp_len = 0;
+			*resp_len = sizeof(*call_resp);
 		}
 		break;
+	}
 
 	default:
 		*status = cpu_to_le32(RPMI_ERR_NOTSUPP);

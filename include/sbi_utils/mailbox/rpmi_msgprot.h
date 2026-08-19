@@ -224,7 +224,7 @@ enum rpmi_servicegroup_id {
 	RPMI_SRVGRP_PERFORMANCE = 0x0000A,
 	RPMI_SRVGRP_MANAGEMENT_MODE = 0x000B,
 	RPMI_SRVGRP_REQFWD = 0x000D,
-	RPMI_SRVGRP_TEE = 0x000E,
+	RPMI_SRVGRP_TEE = 0x0010,
 	RPMI_SRVGRP_ID_MAX_COUNT,
 
 	/* Reserved range for service groups */
@@ -992,7 +992,7 @@ struct rpmi_mm_communicate_rsp {
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
-	RPMI_TEE_SRV_COMMUNICATE = 0x03,
+	RPMI_TEE_SRV_TEE_CALL = 0x13,
 	RPMI_TEE_SRV_MAX_COUNT,
 };
 
@@ -1027,6 +1027,41 @@ enum rpmi_tee_impl_id {
 /** OP-TEE specific communication parameters */
 #define RPMI_TEE_OPTEE_COMM_REQ_REGS	8	/* a0-a7 */
 #define RPMI_TEE_OPTEE_COMM_RESP_REGS	4	/* a0-a3 */
+
+/**
+ * Fixed TEE endpoint identities for this prototype (RPMI spec section 4.16).
+ * A single static REE endpoint invokes a single static OP-TEE endpoint.
+ */
+#define RPMI_TEE_ENDPOINT_REE		0
+#define RPMI_TEE_ENDPOINT_OPTEE	1
+
+/**
+ * Well-known SERVICE UUID identifying the "OP-TEE communicate" service whose
+ * SERVICE_DATA carries the SMC-style a0-a7 register block. This is a fixed,
+ * prototype-local UUID (not an assigned GP/OP-TEE UUID); OpenSBI and the
+ * Linux conduit must agree on these 16 bytes verbatim.
+ *
+ * UUID: 5be1b1a0-7e11-4e7a-9b10-0010c0ffee00
+ */
+#define RPMI_TEE_OPTEE_SERVICE_UUID { \
+	0x5b, 0xe1, 0xb1, 0xa0, 0x7e, 0x11, 0x4e, 0x7a, \
+	0x9b, 0x10, 0x00, 0x10, 0xc0, 0xff, 0xee, 0x00 }
+
+/** TEE_CALL request (RPMI spec section 4.16, Table 218) */
+struct rpmi_tee_call_req {
+	u32 sender_id;
+	u32 target_id;
+	u8 service[16];
+	u32 service_data_len;
+	u8 service_data[];
+};
+
+/** TEE_CALL response (RPMI spec section 4.16, Table 219) */
+struct rpmi_tee_call_resp {
+	s32 status;
+	u32 service_rsp_len;
+	u8 service_rsp[];
+};
 
 /** TEE_GET_ATTRIBUTES response */
 struct rpmi_tee_get_attributes_resp {
