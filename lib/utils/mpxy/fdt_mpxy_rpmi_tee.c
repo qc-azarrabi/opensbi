@@ -97,8 +97,10 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 	case RPMI_TEE_SRV_PROBE_FEATURES: {
 		/*
 		 * TEE_PROBE_FEATURES is answered directly by the framework
-		 * (no TEE domain involvement). None of the optional features
-		 * are supported by this prototype; an unknown feature id is
+		 * (no TEE domain involvement). The memory-parcel modes
+		 * (donate/lend/share) are supported for both REE and TEE and
+		 * report value 2; the remaining optional features are not yet
+		 * supported and report value 0. An unknown feature id is
 		 * rejected.
 		 */
 		struct rpmi_tee_probe_features_req *feat_req = msgbuf;
@@ -119,11 +121,15 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 		case RPMI_TEE_FEAT_MEMORY_DONATE:
 		case RPMI_TEE_FEAT_MEMORY_LEND:
 		case RPMI_TEE_FEAT_MEMORY_SHARE:
+			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
+			feat_resp->value =
+				cpu_to_le32(RPMI_TEE_FEAT_VAL_FULL_REE_TEE);
+			break;
 		case RPMI_TEE_FEAT_SIGNAL_BUS:
 		case RPMI_TEE_FEAT_MULTISEGMENT_OPS:
 		case RPMI_TEE_FEAT_SYSINFO_FORMAT:
 			feat_resp->status = cpu_to_le32(RPMI_SUCCESS);
-			feat_resp->value = 0;
+			feat_resp->value = cpu_to_le32(RPMI_TEE_FEAT_VAL_NONE);
 			break;
 		default:
 			feat_resp->status = cpu_to_le32(RPMI_ERR_INVALID_PARAM);

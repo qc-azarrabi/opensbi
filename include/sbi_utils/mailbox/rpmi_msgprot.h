@@ -1010,6 +1010,11 @@ enum rpmi_tee_feature_id {
 	RPMI_TEE_FEAT_SYSINFO_FORMAT = 6,
 };
 
+/* TEE_PROBE_FEATURES support level reported in the response VALUE (Table 184) */
+#define RPMI_TEE_FEAT_VAL_NONE		0	/* not supported */
+#define RPMI_TEE_FEAT_VAL_TEE_ONLY	1	/* supported TEE-side only */
+#define RPMI_TEE_FEAT_VAL_FULL_REE_TEE	2	/* supported for both REE and TEE */
+
 /** TEE_PROBE_FEATURES request */
 struct rpmi_tee_probe_features_req {
 	u32 feature_id;
