@@ -988,11 +988,15 @@ struct rpmi_mm_communicate_rsp {
 	u32 mm_comm_retdata_size;
 };
 
-/** RPMI TEE ServiceGroup Service IDs */
+/** RPMI TEE ServiceGroup Service IDs (RPMI spec section 4.16) */
 enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_ENABLE_NOTIFICATION = 0x01,
 	RPMI_TEE_SRV_PROBE_FEATURES = 0x02,
 	RPMI_TEE_SRV_PROBE_SYSTEM = 0x03,
+	RPMI_TEE_SRV_SIGNAL_BUS_SETUP = 0x05,
+	RPMI_TEE_SRV_SIGNAL_BUS_TEARDOWN = 0x06,
+	RPMI_TEE_SRV_SIGNAL_RAISE = 0x07,
+	RPMI_TEE_SRV_SIGNAL_RETRIEVE = 0x08,
 	RPMI_TEE_SRV_MEM_PARCEL_CREATE = 0x09,
 	RPMI_TEE_SRV_MEM_PARCEL_ACCEPT = 0x0A,
 	RPMI_TEE_SRV_MEM_PARCEL_RELEASE = 0x0B,
@@ -1003,7 +1007,7 @@ enum rpmi_tee_service_id {
 	RPMI_TEE_SRV_MAX_COUNT,
 };
 
-/** RPMI TEE feature IDs for TEE_PROBE_FEATURES */
+/** RPMI TEE feature IDs for TEE_PROBE_FEATURES (RPMI spec section 4.16, Tables 182-184) */
 enum rpmi_tee_feature_id {
 	RPMI_TEE_FEAT_MEMORY_DONATE = 1,
 	RPMI_TEE_FEAT_MEMORY_LEND = 2,
@@ -1028,6 +1032,73 @@ struct rpmi_tee_probe_features_resp {
 	s32 status;
 	u32 value;
 };
+
+/*
+ * SIGNAL_BUS feature (RPMI_TEE_FEAT_SIGNAL_BUS) value encoding reported by
+ * TEE_PROBE_FEATURES (RPMI spec section 4.16, signal bus):
+ *   [1:0]   delivery mode: 0 = not supported, 1 = System MSI, 2 = System IRQ
+ *   [11:2]  max bus width (max concurrent signals per endpoint pair)
+ *   [31:12] System MSI index or System IRQ index used to notify availability
+ */
+#define RPMI_TEE_SIGNAL_DELIVERY_NONE	0
+#define RPMI_TEE_SIGNAL_DELIVERY_MSI	1
+#define RPMI_TEE_SIGNAL_DELIVERY_IRQ	2
+#define RPMI_TEE_SIGNAL_BUS_VALUE(idx, width, mode) \
+	((((u32)(idx)) << 12) | ((((u32)(width)) & 0x3ff) << 2) | \
+	 (((u32)(mode)) & 0x3))
+
+/** TEE_SIGNAL_BUS_SETUP request (RPMI spec section 4.16.7, Table 190) */
+struct rpmi_tee_signal_bus_setup_req {
+	u32 target_id;
+	u32 bus_width;		/* M: total signals on the bus */
+	u32 sender_signals;	/* N: signals reserved for sender to receive */
+};
+
+/** TEE_SIGNAL_BUS_SETUP response (Table 191) */
+struct rpmi_tee_signal_bus_setup_resp {
+	s32 status;
+};
+
+/** TEE_SIGNAL_BUS_TEARDOWN request (section 4.16.8, Table 192) */
+struct rpmi_tee_signal_bus_teardown_req {
+	u32 target_id;
+};
+
+/** TEE_SIGNAL_BUS_TEARDOWN response (Table 193) */
+struct rpmi_tee_signal_bus_teardown_resp {
+	s32 status;
+};
+
+/** TEE_SIGNAL_RAISE request (section 4.16.9, Table 194) */
+struct rpmi_tee_signal_raise_req {
+	u32 target_id;
+	u32 signal_len;		/* N: length of signal[]; cannot be 0 */
+	u32 signal[];		/* signals to set pending */
+};
+
+/** TEE_SIGNAL_RAISE response (Table 195) */
+struct rpmi_tee_signal_raise_resp {
+	s32 status;
+};
+
+/*
+ * TEE_SIGNAL_RETRIEVE (section 4.16.10): request has no parameters.
+ * Response reports, per bus, the active signals readable by the caller.
+ */
+#define RPMI_TEE_SIGNAL_RETRIEVE_MORE_AVAILABLE	(1U << 31)
+struct rpmi_tee_signal_retrieve_resp {
+	s32 status;
+	u32 flags;		/* bit31 MORE_AVAILABLE; bits30:0 reserved 0 */
+	u32 target_id;
+	u32 signal_len;		/* N: length of signal[]; nonzero on success */
+	u32 signal[];		/* active signals on this bus */
+};
+
+/*
+ * Signal index used by the async-notif doorbell on the width-1 REE<->TEE bus:
+ * OP-TEE raises signal 0, the REE reads it and drains via GET_ASYNC_NOTIF_VALUE.
+ */
+#define RPMI_TEE_SIGNAL_ASYNC_NOTIF	0
 
 /*
  * SYSINFO_FORMAT values reported by TEE_PROBE_FEATURES for the SYSINFO_FORMAT
@@ -1065,7 +1136,7 @@ enum rpmi_tee_impl_id {
 #define RPMI_TEE_OPTEE_COMM_RESP_REGS	4	/* a0-a3 */
 
 /**
- * Fixed TEE endpoint identities for this prototype (RPMI spec section 4.16).
+ * Fixed TEE endpoint identities for the Track-1 prototype (RPMI spec section 4.16).
  * A single static REE endpoint invokes a single static OP-TEE endpoint.
  */
 #define RPMI_TEE_ENDPOINT_REE		0
@@ -1074,8 +1145,8 @@ enum rpmi_tee_impl_id {
 /**
  * Well-known SERVICE UUID identifying the "OP-TEE communicate" service whose
  * SERVICE_DATA carries the SMC-style a0-a7 register block. This is a fixed,
- * prototype-local UUID (not an assigned GP/OP-TEE UUID); OpenSBI and the
- * Linux conduit must agree on these 16 bytes verbatim.
+ * prototype-local UUID (not an assigned GP/OP-TEE UUID); OpenSBI and the Linux
+ * conduit must agree on these 16 bytes verbatim.
  *
  * UUID: 5be1b1a0-7e11-4e7a-9b10-0010c0ffee00
  */
@@ -1147,10 +1218,8 @@ struct rpmi_tee_get_attributes_resp {
 /*
  * MEM_PARCEL_CREATE request (Table 200). Fixed header, then four back-to-back
  * variable-length uint32 arrays accessed via computed offsets into data[]:
- *   receiver_id[receiver_cnt];
- *   access[receiver_cnt];
- *   block_high[block_cnt];
- *   block_low[block_cnt];
+ *   receiver_id[receiver_cnt], access[receiver_cnt],
+ *   block_high[block_cnt], block_low[block_cnt]
  */
 struct rpmi_tee_mem_parcel_create_req {
 	u32 creator_id;
@@ -1170,9 +1239,8 @@ struct rpmi_tee_mem_parcel_create_resp {
 
 /*
  * MEM_PARCEL_ACCEPT request (Table 202). Fixed header, then two back-to-back
- * variable-length uint32 arrays in data[]:
- *   other_id[other_cnt];
- *   other_access[other_cnt];
+ * variable-length uint32 arrays in data[]: other_id[other_cnt],
+ * other_access[other_cnt].
  */
 struct rpmi_tee_mem_parcel_accept_req {
 	u32 acceptor_id;
@@ -1191,9 +1259,7 @@ struct rpmi_tee_mem_parcel_accept_req {
 
 /*
  * MEM_PARCEL_ACCEPT response (Table 203). Fixed header, then the returned
- * block list in data[]:
- *   block_high[block_cnt];
- *   block_low[block_cnt];
+ * block list in data[]: block_high[block_cnt], block_low[block_cnt].
  */
 struct rpmi_tee_mem_parcel_accept_resp {
 	s32 status;
