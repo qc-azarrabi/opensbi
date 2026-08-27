@@ -24,6 +24,10 @@ config FDT_MAILBOX_RPMI_SHMEM
 	depends on RPMI_MAILBOX
 	default n
 
+config FDT_MAILBOX_RPMI_SYSMSI
+	bool "In-framework RPMI System MSI Mailbox Controller"
+	default n
+
 endif
 
 endmenu
