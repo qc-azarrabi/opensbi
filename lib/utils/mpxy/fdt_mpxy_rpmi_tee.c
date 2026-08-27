@@ -18,6 +18,7 @@
 #include <sbi/sbi_string.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_mbox.h>
+#include <sbi_utils/mailbox/fdt_mailbox_rpmi_sysmsi.h>
 #include <sbi_utils/mpxy/fdt_mpxy_rpmi_tee.h>
 #include <sbi_utils/mpxy/rpmi_tee_parcel.h>
 #include <sbi_utils/mailbox/rpmi_mailbox.h>
@@ -459,6 +460,18 @@ static int mpxy_tee_send_message_with_response(struct sbi_mpxy_channel *channel,
 			else
 				tee_signal_bus.pending_for_ree |= (1U << sig);
 		}
+
+		/*
+		 * Doorbell the REE: signals it can read are now pending.
+		 * Delivered as a System MSI at TEE_SIGNAL_MSI_INDEX (the
+		 * index reported in the SIGNAL_BUS feature word). The REE
+		 * still drains the actual pending bits via SIGNAL_RETRIEVE;
+		 * the MSI carries no signal values. No-op until the REE has
+		 * programmed the MSI target (SET_MSI_TARGET/SET_MSI_STATE),
+		 * so firing unconditionally on this path is safe.
+		 */
+		if (!to_tee)
+			rpmi_sysmsi_send(TEE_SIGNAL_MSI_INDEX);
 
 		resp->status = cpu_to_le32(RPMI_SUCCESS);
 		*resp_len = sizeof(*resp);
