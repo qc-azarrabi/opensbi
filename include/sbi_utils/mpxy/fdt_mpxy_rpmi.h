@@ -14,6 +14,7 @@
 
 struct mbox_chan;
 struct mbox_xfer;
+struct fdt_match;
 
 /** MPXY RPMI service data for each service group */
 struct mpxy_rpmi_service_data {
