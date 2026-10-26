@@ -148,6 +148,17 @@ static int parcel_protect_reclaim(struct tee_parcel *parcel)
 	return SBI_ENOTSUPP;
 }
 
+static int parcel_protect_disconnect(struct rpmi_tee_endpoint *ep)
+{
+	/*
+	 * TODO: Serialize with all commits for this endpoint, stop further
+	 * receiver grants and revoke access on every affected hart. Return
+	 * only after in-progress updates cannot republish access. The registry
+	 * lock is not held; backend synchronization must not depend on it.
+	 */
+	return SBI_ENOTSUPP;
+}
+
 /* The busy reservation pins the descriptor while enforcement runs unlocked. */
 static int parcel_protect_run(struct tee_parcel *parcel,
 			      int (*operation)(struct tee_parcel *parcel))
@@ -702,4 +713,31 @@ int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
 out:
 	spin_unlock(&parcel_lock);
 	return ret;
+}
+
+void rpmi_tee_memory_disconnect(struct rpmi_tee_endpoint *ep)
+{
+	struct tee_parcel *parcel;
+	bool update = false;
+
+	spin_lock(&parcel_lock);
+	sbi_list_for_each_entry(parcel, &tee_parcels, node) {
+		if (parcel->receiver != ep)
+			continue;
+		parcel->disconnected = true;
+		if (parcel->busy || !parcel->creating)
+			update = true;
+	}
+	spin_unlock(&parcel_lock);
+	/* Endpoint retirement must fence commits as well as existing grants. */
+	if (update && parcel_protect_disconnect(ep))
+		sbi_hart_hang();
+	spin_lock(&parcel_lock);
+	sbi_list_for_each_entry(parcel, &tee_parcels, node) {
+		if (parcel->receiver != ep || parcel->busy)
+			continue;
+		parcel->accepted = false;
+		parcel->accepting = false;
+	}
+	spin_unlock(&parcel_lock);
 }

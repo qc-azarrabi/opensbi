@@ -43,6 +43,7 @@ static int tee_xfer(struct mpxy_bridge_src_ctx *src,
 
 static const struct mpxy_bridge_source_ops tee_ops = {
 	.require_waiting_retrieval = true,
+	.cancel = rpmi_tee_signal_cancel,
 	.check_domains = rpmi_tee_check_domains,
 	.request = rpmi_tee_request,
 	.xfer = tee_xfer,

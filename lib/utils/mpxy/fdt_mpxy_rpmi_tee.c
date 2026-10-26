@@ -104,6 +104,7 @@ static int tee_channel_xfer(void *context, struct mbox_chan *chan,
 			       &response_len);
 	/* This channel has no route for forwarding requests. */
 	if (ret == SBI_ENOTSUPP) {
+		rpmi_tee_signal_cancel(args->service_id);
 		ret = rpmi_tee_status(xfer->rx, xfer->rx_len, &response_len,
 				      RPMI_ERR_NOTSUPP);
 	}

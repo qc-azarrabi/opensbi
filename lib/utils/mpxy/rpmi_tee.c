@@ -133,7 +133,10 @@ static int tee_probe(struct rpmi_tee_endpoint *caller, u32 service,
 		if (id > RPMI_TEE_FEATURE_MULTISEGMENT_OPS)
 			return rpmi_tee_status(response, maxlen, response_len,
 					       RPMI_ERR_INVALID_PARAM);
-		value = rpmi_tee_memory_feature(id);
+		if (id == RPMI_TEE_FEATURE_SIGNAL_BUS)
+			value = rpmi_tee_signal_feature(caller);
+		else
+			value = rpmi_tee_memory_feature(id);
 		((u32 *)response)[0] = cpu_to_le32(RPMI_SUCCESS);
 		((u32 *)response)[1] = cpu_to_le32(value);
 		*response_len = 2 * sizeof(u32);
@@ -306,6 +309,14 @@ int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len)
 	const struct rpmi_tee_call_resp *resp = data;
 	u32 error = cpu_to_le32(RPMI_ERR_IO);
 
+	if (src->header.service_id == RPMI_TEE_SIGNAL_BUS_SETUP ||
+	    src->header.service_id == RPMI_TEE_SIGNAL_BUS_TEARDOWN) {
+		s32 status = rpmi_tee_signal_complete(src->header.service_id,
+						      data, len);
+
+		error = cpu_to_le32(status);
+		return tee_complete_response(src, &error, sizeof(error));
+	}
 	if (src->header.service_id != RPMI_TEE_CALL ||
 	    len < sizeof(*resp) || le32_to_cpu(resp->status) != RPMI_SUCCESS ||
 	    le32_to_cpu(resp->service_data_len) != len - sizeof(*resp))
@@ -333,6 +344,10 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		return rpmi_tee_status(response, maxlen, response_len,
 				       RPMI_ERR_NOTSUPP);
 	}
+	if (service >= RPMI_TEE_SIGNAL_BUS_SETUP &&
+	    service <= RPMI_TEE_SIGNAL_RETRIEVE)
+		return rpmi_tee_signal_request(caller, service, data, len,
+					       response, maxlen, response_len);
 	if (service >= RPMI_TEE_MEMORY_PARCEL_CREATE &&
 	    service <= RPMI_TEE_MEMORY_SEGMENT_RECEIVE)
 		return rpmi_tee_memory_request(caller, service, data, len,
