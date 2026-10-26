@@ -52,6 +52,7 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		     u32 len, void *response, u32 maxlen,
 		     unsigned long *response_len);
 
+/* Complete forwarded SIGNAL_BUS_SETUP, SIGNAL_BUS_TEARDOWN and TEE_CALL. */
 int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len);
 
 /* Memory parcels */
@@ -60,5 +61,20 @@ u32 rpmi_tee_memory_feature(u32 feature);
 int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
 			    const void *data, u32 len, void *response,
 			    u32 maxlen, unsigned long *response_len);
+void rpmi_tee_memory_disconnect(struct rpmi_tee_endpoint *ep);
+
+/* Signal buses */
+
+void rpmi_tee_signal_set_notify(void (*notify)(u32 endpoint_id));
+u32 rpmi_tee_signal_feature(struct rpmi_tee_endpoint *ep);
+bool rpmi_tee_signal_pending(u32 endpoint_id);
+
+/* Handle signal requests; return SBI_ENOTSUPP to forward SETUP/TEARDOWN. */
+int rpmi_tee_signal_request(struct rpmi_tee_endpoint *caller, u32 service,
+			    const void *data, u32 len, void *response,
+			    u32 maxlen, unsigned long *response_len);
+
+s32 rpmi_tee_signal_complete(u32 service, const void *data, u32 len);
+void rpmi_tee_signal_cancel(u32 service);
 
 #endif
