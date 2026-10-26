@@ -193,7 +193,7 @@ static struct mpxy_rpmi_service_data sysmsi_services[] = {
 
 static const struct mpxy_rpmi_data sysmsi_data = {
 	.servicegrp_id = RPMI_SRVGRP_SYSTEM_MSI,
-	.num_services = RPMI_SYSMSI_SRV_ID_MAX_COUNT,
+	.num_services = array_size(sysmsi_services),
 	.service_data = sysmsi_services,
 	.xfer_group = mpxy_rpmi_sysmis_xfer,
 	.setup_group = mpxy_rpmi_sysmsi_setup,

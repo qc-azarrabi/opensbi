@@ -62,7 +62,7 @@ static struct mpxy_rpmi_service_data voltage_services[] = {
 
 static const struct mpxy_rpmi_data voltage_data = {
 	.servicegrp_id = RPMI_SRVGRP_VOLTAGE,
-	.num_services = RPMI_VOLTAGE_SRV_MAX_COUNT,
+	.num_services = array_size(voltage_services),
 	.service_data = voltage_services,
 };
 

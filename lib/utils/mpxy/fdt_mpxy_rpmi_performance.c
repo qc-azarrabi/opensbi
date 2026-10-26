@@ -76,7 +76,7 @@ static struct mpxy_rpmi_service_data performance_services[] = {
 
 static const struct mpxy_rpmi_data performance_data = {
 	.servicegrp_id = RPMI_SRVGRP_PERFORMANCE ,
-	.num_services = RPMI_PERF_SRV_MAX_COUNT,
+	.num_services = array_size(performance_services),
 	.service_data = performance_services,
 };
 

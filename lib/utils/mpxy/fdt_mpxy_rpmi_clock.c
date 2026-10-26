@@ -72,7 +72,7 @@ static struct mpxy_rpmi_service_data clock_services[] = {
 
 static const struct mpxy_rpmi_data clock_data = {
 	.servicegrp_id = RPMI_SRVGRP_CLOCK,
-	.num_services = RPMI_CLOCK_SRV_MAX_COUNT,
+	.num_services = array_size(clock_services),
 	.service_data = clock_services,
 };
 

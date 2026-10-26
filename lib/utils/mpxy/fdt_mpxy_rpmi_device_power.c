@@ -41,7 +41,7 @@ static struct mpxy_rpmi_service_data dpwr_services[] = {
 
 static const struct mpxy_rpmi_data dpwr_data = {
 	.servicegrp_id = RPMI_SRVGRP_DEVICE_POWER,
-	.num_services = RPMI_DPWR_SRV_MAX_COUNT,
+	.num_services = array_size(dpwr_services),
 	.service_data = dpwr_services,
 };
 

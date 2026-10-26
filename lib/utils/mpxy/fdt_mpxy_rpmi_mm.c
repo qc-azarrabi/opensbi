@@ -102,7 +102,7 @@ static int mpxy_rpmi_mm_xfer(void *context, struct mbox_chan *chan,
 
 static const struct mpxy_rpmi_data mm_data = {
 	.servicegrp_id = RPMI_SRVGRP_MANAGEMENT_MODE,
-	.num_services = RPMI_MM_SRV_MAX_COUNT,
+	.num_services = array_size(mm_srvcdata),
 	.service_data = mm_srvcdata,
 	.setup_group = mpxy_rpmi_mm_setup,
 	.xfer_group = mpxy_rpmi_mm_xfer,

@@ -28,6 +28,7 @@ struct mpxy_rpmi_service_data {
 /** MPXY RPMI data for each service group */
 struct mpxy_rpmi_data {
 	u32 servicegrp_id;
+	/** Number of entries in service_data, independent of service IDs. */
 	u32 num_services;
 	struct mpxy_rpmi_service_data *service_data;
 

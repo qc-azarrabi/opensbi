@@ -36,7 +36,7 @@ static struct mpxy_rpmi_service_data logging_services[] = {
 
 static const struct mpxy_rpmi_data logging_data = {
 	.servicegrp_id = RPMI_SRVGRP_LOGGING,
-	.num_services = RPMI_LOGGING_SRV_MAX_COUNT,
+	.num_services = array_size(logging_services),
 	.service_data = logging_services,
 };
 
