@@ -227,6 +227,7 @@ enum rpmi_servicegroup_id {
 	RPMI_SRVGRP_MANAGEMENT_MODE = 0x000B,
 	RPMI_SRVGRP_REQFWD = 0x000D,
 	RPMI_SRVGRP_LOGGING = 0x000E,
+	RPMI_SRVGRP_TEE = 0x0010,
 	RPMI_SRVGRP_ID_MAX_COUNT,
 
 	/* Reserved range for service groups */
@@ -1083,6 +1084,184 @@ struct rpmi_request_forward_resp {
 struct rpmi_request_complete_resp {
 	u32 status;
 	u32 num_of_messages;
+};
+
+/** RPMI TEE service identifiers (service group 0x0010). */
+enum rpmi_tee_service_id {
+	RPMI_TEE_ENABLE_NOTIFICATION = 0x01,
+	RPMI_TEE_PROBE_FEATURES = 0x02,
+	RPMI_TEE_PROBE_SYSTEM = 0x03,
+	RPMI_TEE_PROBE_DOMAIN = 0x04,
+	RPMI_TEE_PROBE_ENDPOINT = 0x05,
+	RPMI_TEE_PROBE_MEMORY_PARCEL = 0x06,
+	RPMI_TEE_PROBE_MEMORY_SEGMENT = 0x07,
+	RPMI_TEE_PROBE_SERVICE = 0x08,
+	RPMI_TEE_EXIT = 0x09,
+	RPMI_TEE_SIGNAL_BUS_SETUP = 0x0a,
+	RPMI_TEE_SIGNAL_BUS_TEARDOWN = 0x0b,
+	RPMI_TEE_SIGNAL_RAISE = 0x0c,
+	RPMI_TEE_SIGNAL_RETRIEVE = 0x0d,
+	RPMI_TEE_MEMORY_PARCEL_CREATE = 0x0e,
+	RPMI_TEE_MEMORY_PARCEL_ACCEPT = 0x0f,
+	RPMI_TEE_MEMORY_PARCEL_RELEASE = 0x10,
+	RPMI_TEE_MEMORY_PARCEL_RECLAIM = 0x11,
+	RPMI_TEE_MEMORY_SEGMENT_SEND = 0x12,
+	RPMI_TEE_MEMORY_SEGMENT_RECEIVE = 0x13,
+	RPMI_TEE_REGISTER_FOR_LIFECYCLE_INFO = 0x14,
+	RPMI_TEE_ON_START_INFO = 0x15,
+	RPMI_TEE_ON_SHUTDOWN_INFO = 0x16,
+	RPMI_TEE_ON_CHANGED_INFO = 0x17,
+	RPMI_TEE_CALL = 0x18,
+};
+
+/** Feature values are returned in a little-endian status/value pair. */
+enum rpmi_tee_feature_id {
+	RPMI_TEE_FEATURE_MEMORY_DONATE,
+	RPMI_TEE_FEATURE_MEMORY_LEND,
+	RPMI_TEE_FEATURE_MEMORY_SHARE,
+	RPMI_TEE_FEATURE_SIGNAL_BUS,
+	RPMI_TEE_FEATURE_MULTISEGMENT_OPS,
+};
+
+#define RPMI_TEE_MEMORY_UNSUPPORTED	0
+#define RPMI_TEE_MEMORY_TEE_ONLY		1
+#define RPMI_TEE_MEMORY_FULLY_SUPPORTED	2
+#define RPMI_TEE_DOMAIN_TEE		(1U << 31)
+#define RPMI_TEE_ENDPOINT_TEE		(1U << 31)
+#define RPMI_TEE_ENDPOINT_PHYSICAL	(1U << 30)
+#define RPMI_TEE_UUID_SIZE		16
+#define RPMI_TEE_NAME_SIZE		32
+
+/* Access words and physical block lengths use a fixed 4 KB granule. */
+#define RPMI_TEE_ACCESS_READ		(1U << 29)
+#define RPMI_TEE_ACCESS_WRITE		(1U << 30)
+#define RPMI_TEE_ACCESS_EXEC		(1U << 31)
+#define RPMI_TEE_ACCESS_MASK		(7U << 29)
+#define RPMI_TEE_PAGE_SHIFT		12
+#define RPMI_TEE_PAGE_SIZE		(1UL << RPMI_TEE_PAGE_SHIFT)
+#define RPMI_TEE_BLOCK_MAX_PAGES		4096
+#define RPMI_TEE_MULTI_SEGMENT		(1U << 31)
+#define RPMI_TEE_OWNER_TRANSFER		(1U << 30)
+#define RPMI_TEE_LAST_SEGMENT		(1U << 31)
+#define RPMI_TEE_SIGNAL_SYSTEM_MSI	1U
+#define RPMI_TEE_SIGNAL_SYSTEM_IRQ	2U
+#define RPMI_TEE_SIGNAL_MORE_AVAILABLE	(1U << 31)
+
+/** Discovery response prefixes; their arrays follow in wire order. */
+struct rpmi_tee_probe_system_resp {
+	s32 status;
+	u32 caller_domain;
+	u32 caller_endpoint;
+	u32 domain_count;
+	u32 domains[];
+};
+
+struct rpmi_tee_probe_domain_resp {
+	s32 status;
+	u32 flags;
+	u32 endpoint_count;
+	u32 endpoints[];
+};
+
+struct rpmi_tee_probe_endpoint_resp {
+	s32 status;
+	u32 flags;
+	u8 name[RPMI_TEE_NAME_SIZE];
+	u32 proxied_count;
+	u32 parcel_count;
+	u32 service_count;
+	u32 metadata_len;
+	/* Proxied IDs, parcel IDs, UUIDs, then optional metadata bytes. */
+	u8 data[];
+};
+
+struct rpmi_tee_call_req {
+	u32 sender_id;
+	u32 target_id;
+	u8 service[RPMI_TEE_UUID_SIZE];
+	u32 service_data_len;
+	u8 service_data[];
+};
+
+struct rpmi_tee_call_resp {
+	s32 status;
+	u32 service_data_len;
+	u8 service_data[];
+};
+
+struct rpmi_tee_parcel_create_req {
+	u32 creator_id;
+	u32 creator_access;
+	u32 receiver_count;
+	u32 flags;
+	u32 nonce;
+	u32 block_count;
+	u8 label[16];
+	/* Receiver IDs, accesses, BLOCK_HIGH, then BLOCK_LOW arrays. */
+	u32 data[];
+};
+
+struct rpmi_tee_parcel_accept_req {
+	u32 acceptor_id;
+	u32 access;
+	u32 parcel_id;
+	u32 nonce;
+	u32 creator_id;
+	u32 creator_access;
+	u32 flags;
+	u32 address_high;
+	u32 address_low;
+	u32 max_pages;
+	u32 other_count;
+	u32 data[];
+};
+
+struct rpmi_tee_parcel_accept_resp {
+	s32 status;
+	u32 flags;
+	u32 page_count;
+	u32 block_count;
+	u32 blocks[];
+};
+
+struct rpmi_tee_segment_send_req {
+	u32 parcel_id;
+	u32 flags;
+	u32 block_count;
+	u32 blocks[];
+};
+
+struct rpmi_tee_segment_receive_resp {
+	s32 status;
+	u32 flags;
+	u32 block_count;
+	u32 blocks[];
+};
+
+struct rpmi_tee_signal_bus_setup_req {
+	u32 sender_id;
+	u32 target_id;
+	u32 width;
+	u32 sender_signals;
+};
+
+struct rpmi_tee_signal_bus_teardown_req {
+	u32 sender_id;
+	u32 target_id;
+};
+
+struct rpmi_tee_signal_raise_req {
+	u32 target_id;
+	u32 signal_count;
+	u32 signals[];
+};
+
+struct rpmi_tee_signal_retrieve_resp {
+	s32 status;
+	u32 flags;
+	u32 target_id;
+	u32 signal_count;
+	u32 signals[];
 };
 
 #endif /* !__RPMI_MSGPROT_H__ */
