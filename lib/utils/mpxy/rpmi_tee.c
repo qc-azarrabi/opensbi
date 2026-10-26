@@ -118,3 +118,178 @@ int rpmi_tee_register_endpoint(const void *fdt, int nodeoff)
 
 	return 0;
 }
+
+/* Handle feature and topology queries using the endpoint registry. */
+static int tee_handle_probe(struct rpmi_tee_endpoint *caller, u32 service,
+			    const void *data, u32 len, void *response, u32 maxlen,
+			    unsigned long *response_len)
+{
+	struct rpmi_tee_status_resp *status_resp = response;
+	s32 status = RPMI_ERR_INVALID_PARAM;
+
+	switch (service) {
+	case RPMI_TEE_PROBE_FEATURES: {
+		const struct rpmi_tee_probe_features_req *req = data;
+		struct rpmi_tee_probe_features_resp *resp = response;
+		u32 id, value;
+
+		if (len != sizeof(*req) || maxlen < sizeof(*resp))
+			goto out_status;
+
+		id = le32_to_cpu(req->feature_id);
+		if (id > RPMI_TEE_FEATURE_MULTISEGMENT_OPS)
+			goto out_status;
+		if (id == RPMI_TEE_FEATURE_SIGNAL_BUS)
+			value = rpmi_tee_signal_feature(caller);
+		else
+			value = rpmi_tee_memory_feature(id);
+
+		resp->status = cpu_to_le32(RPMI_SUCCESS);
+		resp->value = cpu_to_le32(value);
+		*response_len = sizeof(*resp);
+
+		return 0;
+	}
+
+	case RPMI_TEE_PROBE_SYSTEM: {
+		struct rpmi_tee_probe_system_resp *resp = response;
+		struct rpmi_tee_endpoint *ep;
+		u32 count = 0;
+
+		/* No req for PROBE_SYSTEM. */
+		if (len || maxlen < sizeof(*resp))
+			goto out_status;
+
+		sbi_list_for_each_entry(ep, &tee_endpoints, node) {
+			struct sbi_domain *dom = rpmi_tee_endpoint_domain(ep);
+			/* Skip unavailable endpoints or missing domains. */
+			if (!dom || !rpmi_tee_endpoint_available(ep))
+				continue;
+
+			if (count >= (maxlen - sizeof(*resp)) / sizeof(u32))
+				return SBI_ENOSPC;
+
+			resp->domains[count++] = cpu_to_le32(dom->index);
+		}
+
+		resp->status = cpu_to_le32(RPMI_SUCCESS);
+		resp->caller_domain =
+			cpu_to_le32(rpmi_tee_endpoint_domain(caller)->index);
+		resp->caller_endpoint = cpu_to_le32(caller->id);
+		resp->domain_count = cpu_to_le32(count);
+		*response_len = sizeof(*resp) + count * sizeof(u32);
+
+		return 0;
+	}
+
+	case RPMI_TEE_PROBE_DOMAIN: {
+		const struct rpmi_tee_probe_domain_req *req = data;
+		struct rpmi_tee_probe_domain_resp *resp = response;
+		struct rpmi_tee_endpoint *ep;
+		u32 id;
+
+		if (len != sizeof(*req))
+			goto out_status;
+		/* Each domain has one endpoint; reserve room for its ID. */
+		if (maxlen < sizeof(*resp) + sizeof(u32))
+			return SBI_ENOSPC;
+
+		id = le32_to_cpu(req->domain_id);
+
+		sbi_list_for_each_entry(ep, &tee_endpoints, node) {
+			struct sbi_domain *dom = rpmi_tee_endpoint_domain(ep);
+			/* Find an available endpoint in the requested domain. */
+			if (!dom || dom->index != id ||
+			    !rpmi_tee_endpoint_available(ep))
+				continue;
+
+			resp->status = cpu_to_le32(RPMI_SUCCESS);
+			resp->flags = cpu_to_le32(ep->tee ?
+						  RPMI_TEE_DOMAIN_TEE : 0);
+			resp->endpoint_count = cpu_to_le32(1); /* Only 1 ep.*/
+			resp->endpoints[0] = cpu_to_le32(ep->id);
+			*response_len = sizeof(*resp) + sizeof(u32);
+
+			return 0;
+		}
+		goto out_status;
+	}
+
+	case RPMI_TEE_PROBE_ENDPOINT: {
+		const struct rpmi_tee_probe_endpoint_req *req = data;
+		struct rpmi_tee_probe_endpoint_resp *resp = response;
+		struct rpmi_tee_endpoint *ep;
+		u32 size;
+
+		if (len != sizeof(*req))
+			goto out_status;
+
+		ep = rpmi_tee_endpoint_by_id(le32_to_cpu(req->endpoint_id));
+		if (!ep || !rpmi_tee_endpoint_available(ep) ||
+		    !rpmi_tee_endpoint_domain(ep))
+			goto out_status;
+
+		/* The fixed response fields are followed by service UUIDs. */
+		size = sizeof(*resp) + ep->service_count * RPMI_TEE_UUID_SIZE;
+		if (size > maxlen)
+			return SBI_ENOSPC;
+
+		sbi_memset(resp, 0, sizeof(*resp));
+		resp->status = cpu_to_le32(RPMI_SUCCESS);
+		resp->flags = cpu_to_le32(RPMI_TEE_ENDPOINT_PHYSICAL |
+					 (ep->tee ? RPMI_TEE_ENDPOINT_TEE : 0));
+		sbi_memcpy(resp->name, ep->name, sizeof(resp->name));
+		resp->service_count = cpu_to_le32(ep->service_count);
+		if (ep->service_count)
+			sbi_memcpy(resp->data, ep->services,
+				   ep->service_count * RPMI_TEE_UUID_SIZE);
+		*response_len = size;
+
+		return 0;
+	}
+
+	default:
+		status = RPMI_ERR_NOTSUPP;
+		break;
+	}
+
+out_status:
+	if (maxlen < sizeof(*status_resp))
+		return SBI_ENOSPC;
+
+	status_resp->status = cpu_to_le32(status);
+	*response_len = sizeof(*status_resp);
+
+	return 0;
+}
+
+/* Handle requests locally; return SBI_ENOTSUPP to request forwarding. */
+int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
+		     u32 len, void *response, u32 maxlen,
+		     unsigned long *response_len)
+{
+	struct rpmi_tee_status_resp *status_resp = response;
+	struct rpmi_tee_endpoint *caller = rpmi_tee_endpoint_by_domain(dom);
+	s32 status;
+
+	if (!caller || !rpmi_tee_endpoint_available(caller)) {
+		status = RPMI_ERR_DENIED;
+		goto out_status;
+	}
+
+	if (service >= RPMI_TEE_PROBE_FEATURES &&
+	    service <= RPMI_TEE_PROBE_ENDPOINT)
+		return tee_handle_probe(caller, service, data, len, response, maxlen,
+				 response_len);
+
+	status = RPMI_ERR_NOTSUPP;
+
+out_status:
+	if (maxlen < sizeof(*status_resp))
+		return SBI_ENOSPC;
+
+	status_resp->status = cpu_to_le32(status);
+	*response_len = sizeof(*status_resp);
+
+	return 0;
+}
