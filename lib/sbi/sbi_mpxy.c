@@ -81,6 +81,11 @@ struct mpxy_state {
 	bool sse_avail;
 	/* MPXY Shared memory details */
 	struct mpxy_shmem shmem;
+	/* A domain switch may defer the return from send-with-response. */
+	bool send_pending;
+	bool response_ready;
+	unsigned long response_maxlen;
+	unsigned long response_len;
 };
 
 static struct mpxy_state *sbi_domain_get_mpxy_state(struct sbi_domain *dom,
@@ -711,6 +716,39 @@ out:
 	return ret;
 }
 
+void sbi_mpxy_cancel_completion(struct sbi_domain *dom)
+{
+	struct mpxy_state *ms;
+
+	if (!dom)
+		return;
+
+	ms = sbi_domain_get_mpxy_state(dom, current_hartindex());
+	if (ms && ms->send_pending)
+		ms->response_ready = false;
+}
+
+int sbi_mpxy_complete_message(struct sbi_domain *dom, unsigned long len)
+{
+	struct mpxy_state *ms;
+
+	if (!dom)
+		return SBI_EINVAL;
+
+	ms = sbi_domain_get_mpxy_state(dom, current_hartindex());
+	/* Require a pending exchange that has not already been completed. */
+	if (!ms || !ms->send_pending || ms->response_ready)
+		return SBI_EINVAL;
+
+	if (len > ms->response_maxlen)
+		return SBI_ENOSPC;
+
+	ms->response_len = len;
+	ms->response_ready = true;
+
+	return 0;
+}
+
 int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 			  unsigned long msg_data_len,
 			  unsigned long *resp_data_len)
@@ -724,6 +762,8 @@ int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 
 	if (!mpxy_shmem_enabled(ms))
 		return SBI_ERR_NO_SHMEM;
+	if (ms->send_pending)
+		return SBI_ERR_FAILED;
 
 	channel = mpxy_find_channel(channel_id, dom);
 	if (!channel)
@@ -743,6 +783,11 @@ int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 	sbi_hart_protection_temp_map_range((unsigned long)shmem_base, mpxy_shmem_size);
 
 	if (resp_data_len) {
+		ms->send_pending = true;
+		ms->response_ready = false;
+		/* Save this exchange's limit for completion after a domain handoff. */
+		ms->response_maxlen = MIN(mpxy_shmem_size,
+					  channel->attrs.msg_data_maxlen);
 		resp_buf = shmem_base;
 		resp_bufsize = mpxy_shmem_size;
 		ret = channel->send_message_with_response(channel, msg_id,
@@ -758,6 +803,23 @@ int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 	}
 
 	sbi_hart_protection_temp_unmap_range((unsigned long)shmem_base, mpxy_shmem_size);
+
+	/* The callback may have restored another domain's pending SBI call. */
+	if (sbi_domain_thishart_ptr() != dom) {
+		ms = sbi_domain_mpxy_state_thishart_ptr();
+		if (!resp_data_len || !ms || !ms->send_pending ||
+		    !ms->response_ready)
+			return SBI_ERR_FAILED;
+
+		/* Return the restored domain's response. */
+		*resp_data_len = ms->response_len;
+		ms->send_pending = false;
+		ms->response_ready = false;
+
+		return SBI_SUCCESS;
+	}
+
+	ms->send_pending = false;
 
 	if (ret == SBI_ERR_TIMEOUT || ret == SBI_ERR_IO)
 		return ret;

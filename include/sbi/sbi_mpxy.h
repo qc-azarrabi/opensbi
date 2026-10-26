@@ -15,6 +15,19 @@
 struct sbi_scratch;
 struct sbi_domain;
 
+/**
+ * Complete a domain's pending send-with-response on the current hart.
+ *
+ * The caller must prepare len response bytes at the start of that domain's
+ * registered MPXY scratch buffer on the current hart before calling this
+ * function. This records the response length without copying any data.
+ * Call before switching back to the domain.
+ */
+int sbi_mpxy_complete_message(struct sbi_domain *dom, unsigned long len);
+
+/** Withdraw a prepared response if the domain handoff could not start. */
+void sbi_mpxy_cancel_completion(struct sbi_domain *dom);
+
 #define SBI_MPXY_MSGPROTO_VERSION(Major, Minor) ((Major << 16) | Minor)
 
 enum sbi_mpxy_attr_id {
