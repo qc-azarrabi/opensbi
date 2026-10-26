@@ -49,6 +49,8 @@ struct mpxy_bridge_source_driver {
 struct mpxy_bridge_source_ops {
 	/** Require a pending destination retrieval before forwarding. */
 	bool require_waiting_retrieval;
+	/** Roll back local preparation when forwarding fails. */
+	void (*cancel)(u32 service);
 	/** Handle a local service; SBI_ENOTSUPP selects forwarding. */
 	int (*request)(struct sbi_domain *dom, u32 service, const void *data,
 		       u32 len, void *response, u32 maxlen,

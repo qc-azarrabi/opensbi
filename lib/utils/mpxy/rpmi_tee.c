@@ -328,10 +328,21 @@ static int tee_complete_response(struct mpxy_bridge_src_ctx *src,
 	return 0;
 }
 
+/* Complete forwarded SIGNAL_BUS_SETUP, SIGNAL_BUS_TEARDOWN and TEE_CALL. */
 int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len)
 {
 	const struct rpmi_tee_call_resp *resp = data;
 	u32 error = cpu_to_le32(RPMI_ERR_IO);
+
+	if (src->header.service_id == RPMI_TEE_SIGNAL_BUS_SETUP ||
+	    src->header.service_id == RPMI_TEE_SIGNAL_BUS_TEARDOWN) {
+		s32 status = rpmi_tee_signal_complete(src->header.service_id,
+						      data, len);
+
+		error = cpu_to_le32(status);
+
+		return tee_complete_response(src, &error, sizeof(error));
+	}
 
 	if (src->header.service_id != RPMI_TEE_CALL)
 		return tee_complete_response(src, &error, sizeof(error));
@@ -362,6 +373,12 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		status = RPMI_ERR_DENIED;
 		goto out_status;
 	}
+
+	/* SETUP/TEARDOWN can return SBI_ENOTSUPP to request forwarding. */
+	if (service >= RPMI_TEE_SIGNAL_BUS_SETUP &&
+	    service <= RPMI_TEE_SIGNAL_RETRIEVE)
+		return rpmi_tee_signal_request(caller, service, data, len,
+					       response, maxlen, response_len);
 
 	if (service >= RPMI_TEE_MEMORY_PARCEL_CREATE &&
 	    service <= RPMI_TEE_MEMORY_SEGMENT_RECEIVE)

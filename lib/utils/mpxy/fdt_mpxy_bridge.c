@@ -422,6 +422,8 @@ static int bridge_send_message_with_response(struct sbi_mpxy_channel *channel,
 		if (slot->active_source >= 0 ||
 		    (source->ops->require_waiting_retrieval &&
 		     !dst->waiting)) {
+			if (source->ops->cancel)
+				source->ops->cancel(msg_id);
 			if (resp_bufsize < sizeof(u32))
 				return SBI_ENOSPC;
 			*(u32 *)respbuf = cpu_to_le32(RPMI_ERR_BUSY);
@@ -460,6 +462,8 @@ static int bridge_send_message_with_response(struct sbi_mpxy_channel *channel,
 				sbi_mpxy_cancel_completion(br->dst.ep.dom);
 				dst->waiting = true;
 			}
+			if (source->ops->cancel)
+				source->ops->cancel(msg_id);
 			slot->active_source = -1;
 			bridge_src_ctx_release(src);
 		}
