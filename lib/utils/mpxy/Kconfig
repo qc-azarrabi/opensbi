@@ -9,6 +9,7 @@ config FDT_MPXY
 
 config FDT_MPXY_BRIDGE
 	bool "MPXY bridge driver for interdomain communication"
+	depends on FDT_MPXY_RPMI
 	default n
 
 config FDT_MPXY_RPMI
