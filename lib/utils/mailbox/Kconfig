@@ -24,6 +24,13 @@ config FDT_MAILBOX_RPMI_SHMEM
 	depends on RPMI_MAILBOX
 	default n
 
+config FDT_MAILBOX_RPMI_TEE_MSI
+	bool "Firmware RPMI TEE System MSI sources"
+	depends on FDT_MPXY_RPMI_TEE
+	select IRQCHIP_IMSIC
+	select RPMI_MAILBOX
+	default n
+
 endif
 
 endmenu
