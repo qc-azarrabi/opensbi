@@ -11,6 +11,7 @@
 
 #define TEE_MAX_PARCELS		64
 #define TEE_MAX_PAGES		4096
+#define TEE_MAX_SEGMENTED	4
 
 struct tee_block {
 	unsigned long address;
@@ -28,12 +29,16 @@ struct tee_block_batch {
 /*
  * Parcel lifecycle. NONE means the parcel is absent from the registry.
  *
- * State     Successful operation  Next
- * --------  --------------------  --------
- * NONE      CREATE                CREATED
- * CREATED   ACCEPT                ACCEPTED
- * ACCEPTED  RELEASE               CREATED
- * CREATED   RECLAIM               NONE
+ * State              Successful operation             Next
+ * -----------------  ------------------------------  ---------
+ * NONE               Segmented CREATE                CREATING
+ * NONE               Single-segment CREATE           CREATED
+ * CREATING           Final SEGMENT_SEND              CREATED
+ * CREATED            ACCEPT with remaining blocks    ACCEPTING
+ * CREATED            ACCEPT with all blocks          ACCEPTED
+ * ACCEPTING          Final SEGMENT_RECEIVE           ACCEPTED
+ * ACCEPTING/ACCEPTED RELEASE                         CREATED
+ * CREATING/CREATED   RECLAIM                         NONE
  *
  * ''busy'' reserves a parcel for one operation.
  *   - CREATE sets it before publishing the provisional entry;
@@ -50,10 +55,11 @@ struct tee_block_batch {
  *
  * ''disconnected'' marks a parcel whose receiver has failed. Only RECLAIM is
  * allowed afterward.
- *   - If busy is clear, disconnect changes ACCEPTED to CREATED;
+ *   - If busy is clear, disconnect changes ACCEPTING/ACCEPTED to CREATED;
  *   - If busy is set, the request wrapper makes that change when the
  *     operation finishes.
  *
+ * CREATING is preserved because the block description is incomplete.
  * The parcel remains registered and disconnected until its creator
  * reclaims it.
  *
@@ -62,7 +68,9 @@ struct tee_block_batch {
  * and cross-hart synchronization without holding the global spinlock.
  */
 enum tee_parcel_state {
+	TEE_PARCEL_CREATING,
 	TEE_PARCEL_CREATED,
+	TEE_PARCEL_ACCEPTING,
 	TEE_PARCEL_ACCEPTED,
 };
 
@@ -79,6 +87,7 @@ struct tee_parcel {
 	/* Block batches from CREATE and subsequent SEGMENT_SEND requests. */
 	struct sbi_dlist batches;
 	enum tee_parcel_state state;
+	u32 receive_next;
 	bool busy;
 	bool disconnected;
 };
@@ -220,6 +229,22 @@ static u32 parcel_alloc_id(void)
 	return parcel_next_id++;
 }
 
+/* Count the endpoint's incomplete segmented CREATE and ACCEPT operations. */
+static u32 pending_segments(struct rpmi_tee_endpoint *ep)
+{
+	struct tee_parcel *p;
+	u32 count = 0;
+
+	tee_parcel_for_each(p) {
+		if (p->creator == ep && p->state == TEE_PARCEL_CREATING)
+			count++;
+		if (p->receiver == ep && p->state == TEE_PARCEL_ACCEPTING)
+			count++;
+	}
+
+	return count;
+}
+
 /* Check overlap with blocks whose address ranges are already validated. */
 static bool parcel_blocks_overlap(const struct tee_block *blocks, u32 count,
 				  unsigned long address, unsigned long size)
@@ -357,6 +382,7 @@ static int parcel_create(struct rpmi_tee_endpoint *caller, const void *data,
 	struct tee_block_batch *batch;
 	u32 creator_access, access, count;
 	s32 status = RPMI_ERR_INVALID_PARAM;
+	bool segmented;
 	int ret;
 
 	/* Require the prefix, receiver ID/access pair and response space. */
@@ -386,6 +412,12 @@ static int parcel_create(struct rpmi_tee_endpoint *caller, const void *data,
 	    ((creator_access | access) & ~RPMI_TEE_ACCESS_MASK))
 		goto out_status;
 
+	segmented = !!(le32_to_cpu(req->flags) & RPMI_TEE_MULTI_SEGMENT);
+	if (segmented && pending_segments(caller) >= TEE_MAX_SEGMENTED) {
+		status = RPMI_ERR_BUSY;
+		goto out_status;
+	}
+
 	if (parcel_count >= TEE_MAX_PARCELS) {
 		status = RPMI_ERR_BUSY;
 		goto out_status;
@@ -403,7 +435,10 @@ static int parcel_create(struct rpmi_tee_endpoint *caller, const void *data,
 	p->creator_access = creator_access;
 	p->access = access;
 	p->nonce = le32_to_cpu(req->nonce);
-	p->state = TEE_PARCEL_CREATED;
+	if (segmented)
+		p->state = TEE_PARCEL_CREATING;
+	else
+		p->state = TEE_PARCEL_CREATED;
 	/* BLOCK_HIGH/LOW arrays follow the receiver ID/access pair. */
 	ret = parcel_decode_blocks(req->data + 2, req->data + 2 + count,
 				   count, &batch);
@@ -455,6 +490,84 @@ out_status:
 	return 0;
 }
 
+static int parcel_segment_send(struct rpmi_tee_endpoint *caller,
+			       const void *data, u32 len, void *response,
+			       u32 maxlen, unsigned long *response_len)
+{
+	struct rpmi_tee_status_resp *status_resp = response;
+	const struct rpmi_tee_segment_send_req *req = data;
+	struct tee_parcel *p;
+	struct tee_block_batch *batch;
+	u32 count, flags;
+	s32 status = RPMI_ERR_INVALID_PARAM;
+	int ret;
+
+	if (len < sizeof(*req))
+		goto out_status;
+
+	p = parcel_find(le32_to_cpu(req->parcel_id));
+	if (!p || p->creator != caller || p->state != TEE_PARCEL_CREATING)
+		goto out_status;
+
+	flags = le32_to_cpu(req->flags);
+	if (flags & ~RPMI_TEE_LAST_SEGMENT)
+		goto out_status;
+
+	count = le32_to_cpu(req->block_count);
+	/* Require complete block pairs within the parcel's block limit. */
+	if (!count || count > TEE_MAX_PAGES - p->block_count ||
+	    count != (len - sizeof(*req)) / (2 * sizeof(u32)) ||
+	    (len - sizeof(*req)) % (2 * sizeof(u32)))
+		goto out_status;
+
+	/* Decode and validate the segment before appending it to the parcel. */
+	ret = parcel_decode_blocks(req->blocks, req->blocks + count, count,
+				   &batch);
+	if (ret) {
+		status = parcel_error(ret);
+		goto out_status;
+	}
+
+	if (batch->page_count > TEE_MAX_PAGES - p->page_count)
+		goto out_free_batch;
+
+	sbi_list_add_tail(&batch->node, &p->batches);
+	p->block_count += batch->count;
+	p->page_count += batch->page_count;
+
+	ret = parcel_protect_run(p, parcel_protect_check);
+	if (!ret && (flags & RPMI_TEE_LAST_SEGMENT))
+		/* For final segment run parcel_protect_create. */
+		ret = parcel_protect_run(p, parcel_protect_create);
+	if (ret) {
+		/* Remove only the new batch if protection fails. */
+		sbi_list_del(&batch->node);
+		p->block_count -= batch->count;
+		p->page_count -= batch->page_count;
+		status = parcel_error(ret);
+		goto out_free_batch;
+	}
+
+	if (flags & RPMI_TEE_LAST_SEGMENT)
+		p->state = TEE_PARCEL_CREATED;
+
+	status = RPMI_SUCCESS;
+
+	goto out_status;
+
+out_free_batch:
+	sbi_free(batch);
+
+out_status:
+	if (maxlen < sizeof(*status_resp))
+		return SBI_ENOSPC;
+
+	status_resp->status = cpu_to_le32(status);
+	*response_len = sizeof(*status_resp);
+
+	return 0;
+}
+
 static int parcel_accept(struct rpmi_tee_endpoint *caller, const void *data,
 			 u32 len, void *response, u32 maxlen,
 			 unsigned long *response_len)
@@ -471,7 +584,7 @@ static int parcel_accept(struct rpmi_tee_endpoint *caller, const void *data,
 		goto out_status;
 
 	p = parcel_find(le32_to_cpu(req->parcel_id));
-	if (!p || p->receiver != caller)
+	if (!p || p->receiver != caller || p->state == TEE_PARCEL_CREATING)
 		goto out_status;
 
 	if (le32_to_cpu(req->acceptor_id) != caller->id ||
@@ -491,7 +604,8 @@ static int parcel_accept(struct rpmi_tee_endpoint *caller, const void *data,
 	if (le32_to_cpu(req->max_pages) < p->page_count)
 		goto out_status;
 
-	if (p->state == TEE_PARCEL_ACCEPTED) {
+	if (p->state == TEE_PARCEL_ACCEPTED ||
+	    p->state == TEE_PARCEL_ACCEPTING) {
 		status = RPMI_ERR_ALREADY;
 		goto out_status;
 	}
@@ -499,21 +613,91 @@ static int parcel_accept(struct rpmi_tee_endpoint *caller, const void *data,
 	if (maxlen < sizeof(*resp) + rpmi_tee_block_array_size(1))
 		return SBI_ENOSPC;
 
-	count = p->block_count;
-	if (maxlen < sizeof(*resp) + rpmi_tee_block_array_size(count))
-		return SBI_ENOSPC;
+	/* Return as many BLOCK_HIGH/LOW pairs as fit in the response. */
+	count = MIN(p->block_count,
+		    (maxlen - sizeof(*resp)) / rpmi_tee_block_array_size(1));
+	if (count < p->block_count) {
+		if (pending_segments(caller) >= TEE_MAX_SEGMENTED) {
+			status = RPMI_ERR_BUSY;
+			goto out_status;
+		}
 
-	ret = parcel_protect_run(p, parcel_protect_accept);
-	if (ret) {
-		status = parcel_error(ret);
-		goto out_status;
+		p->state = TEE_PARCEL_ACCEPTING;
+		p->receive_next = count;
+	} else {
+		/* For non-segmented accept run parcel_protect_accept. */
+		ret = parcel_protect_run(p, parcel_protect_accept);
+		if (ret) {
+			status = parcel_error(ret);
+			goto out_status;
+		}
+
+		p->state = TEE_PARCEL_ACCEPTED;
 	}
-	p->state = TEE_PARCEL_ACCEPTED;
+
 	resp->status = cpu_to_le32(RPMI_SUCCESS);
-	resp->flags = 0;
+	resp->flags = cpu_to_le32(p->state == TEE_PARCEL_ACCEPTING ?
+				  RPMI_TEE_MULTI_SEGMENT : 0);
 	resp->page_count = cpu_to_le32(p->page_count);
 	resp->block_count = cpu_to_le32(count);
 	parcel_put_blocks(resp->blocks, p, 0, count);
+	*response_len = sizeof(*resp) + rpmi_tee_block_array_size(count);
+
+	return 0;
+
+out_status:
+	if (maxlen < sizeof(*status_resp))
+		return SBI_ENOSPC;
+
+	status_resp->status = cpu_to_le32(status);
+	*response_len = sizeof(*status_resp);
+
+	return 0;
+}
+
+static int parcel_segment_receive(struct rpmi_tee_endpoint *caller,
+				  const void *data, u32 len, void *response,
+				  u32 maxlen, unsigned long *response_len)
+{
+	struct rpmi_tee_status_resp *status_resp = response;
+	const struct rpmi_tee_segment_receive_req *req = data;
+	struct rpmi_tee_segment_receive_resp *resp = response;
+	struct tee_parcel *p;
+	u32 count;
+	bool last;
+	s32 status = RPMI_ERR_INVALID_PARAM;
+	int ret;
+
+	if (len != sizeof(*req) || le32_to_cpu(req->acceptor_id) != caller->id)
+		goto out_status;
+
+	p = parcel_find(le32_to_cpu(req->parcel_id));
+	if (!p || p->receiver != caller || p->state != TEE_PARCEL_ACCEPTING)
+		goto out_status;
+
+	if (maxlen < sizeof(*resp) + rpmi_tee_block_array_size(1))
+		return SBI_ENOSPC;
+
+	/* Return as many BLOCK_HIGH/LOW pairs as fit in the response. */
+	count = MIN(p->block_count - p->receive_next,
+		    (maxlen - sizeof(*resp)) / rpmi_tee_block_array_size(1));
+	last = p->receive_next + count == p->block_count;
+	if (last) {
+		/* For final segment run parcel_protect_accept. */
+		ret = parcel_protect_run(p, parcel_protect_accept);
+		if (ret) {
+			status = parcel_error(ret);
+			goto out_status;
+		}
+
+		p->state = TEE_PARCEL_ACCEPTED;
+	}
+
+	resp->status = cpu_to_le32(RPMI_SUCCESS);
+	resp->flags = cpu_to_le32(last ? RPMI_TEE_LAST_SEGMENT : 0);
+	resp->block_count = cpu_to_le32(count);
+	parcel_put_blocks(resp->blocks, p, p->receive_next, count);
+	p->receive_next += count;
 	*response_len = sizeof(*resp) + rpmi_tee_block_array_size(count);
 
 	return 0;
@@ -552,7 +736,8 @@ static int parcel_release(struct rpmi_tee_endpoint *caller, const void *data,
 	if (!p || p->receiver != caller)
 		goto out_status;
 
-	if (p->state != TEE_PARCEL_ACCEPTED)
+	if (p->state != TEE_PARCEL_ACCEPTED &&
+	    p->state != TEE_PARCEL_ACCEPTING)
 		goto out_status;
 
 	if (p->state == TEE_PARCEL_ACCEPTED) {
@@ -594,16 +779,21 @@ static int parcel_reclaim(struct rpmi_tee_endpoint *caller, const void *data,
 	if (!p || p->creator != caller)
 		goto out_status;
 
-	if (p->state == TEE_PARCEL_ACCEPTED) {
+	if (p->state == TEE_PARCEL_ACCEPTED ||
+	    p->state == TEE_PARCEL_ACCEPTING) {
 		status = RPMI_ERR_DENIED;
 		goto out_status;
 	}
 
-	ret = parcel_protect_run(p, parcel_protect_reclaim);
-	if (ret) {
-		status = parcel_error(ret);
-		goto out_status;
+	/* Incomplete creation needs no permission restoration. */
+	if (p->state != TEE_PARCEL_CREATING) {
+		ret = parcel_protect_run(p, parcel_protect_reclaim);
+		if (ret) {
+			status = parcel_error(ret);
+			goto out_status;
+		}
 	}
+
 	sbi_list_del(&p->node);
 	parcel_count--;
 	parcel_free_blocks(p);
@@ -643,6 +833,12 @@ static int parcel_dispatch(struct rpmi_tee_endpoint *caller, u32 service,
 	case RPMI_TEE_MEMORY_PARCEL_RELEASE:
 		return parcel_release(caller, data, len, response, maxlen,
 				      response_len);
+	case RPMI_TEE_MEMORY_SEGMENT_SEND:
+		return parcel_segment_send(caller, data, len, response, maxlen,
+					   response_len);
+	case RPMI_TEE_MEMORY_SEGMENT_RECEIVE:
+		return parcel_segment_receive(caller, data, len, response,
+					      maxlen, response_len);
 	case RPMI_TEE_MEMORY_PARCEL_RECLAIM:
 		return parcel_reclaim(caller, data, len, response, maxlen,
 				      response_len);
@@ -682,6 +878,15 @@ int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
 		lookup = true;
 		break;
 	}
+	case RPMI_TEE_MEMORY_SEGMENT_RECEIVE: {
+		const struct rpmi_tee_segment_receive_req *req = data;
+
+		if (len < sizeof(*req))
+			goto out_status;
+		id = le32_to_cpu(req->parcel_id);
+		lookup = true;
+		break;
+	}
 	case RPMI_TEE_MEMORY_PARCEL_RELEASE: {
 		const struct rpmi_tee_parcel_release_req *req = data;
 
@@ -693,6 +898,15 @@ int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
 	}
 	case RPMI_TEE_MEMORY_PARCEL_RECLAIM: {
 		const struct rpmi_tee_parcel_reclaim_req *req = data;
+
+		if (len < sizeof(*req))
+			goto out_status;
+		id = le32_to_cpu(req->parcel_id);
+		lookup = true;
+		break;
+	}
+	case RPMI_TEE_MEMORY_SEGMENT_SEND: {
+		const struct rpmi_tee_segment_send_req *req = data;
 
 		if (len < sizeof(*req))
 			goto out_status;
@@ -734,7 +948,8 @@ int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
 		parcel = parcel_find(id);
 		if (parcel) {
 			parcel->busy = false;
-			if (parcel->disconnected)
+			if (parcel->disconnected &&
+			    parcel->state != TEE_PARCEL_CREATING)
 				parcel->state = TEE_PARCEL_CREATED;
 		}
 	}
@@ -762,6 +977,8 @@ out_status:
 
 u32 rpmi_tee_memory_feature(u32 feature)
 {
+	if (feature == RPMI_TEE_FEATURE_MULTISEGMENT_OPS)
+		return TEE_MAX_SEGMENTED;
 	if (feature == RPMI_TEE_FEATURE_MEMORY_SHARE)
 		return RPMI_TEE_MEMORY_FULLY_SUPPORTED;
 
@@ -779,7 +996,8 @@ void rpmi_tee_memory_disconnect(struct rpmi_tee_endpoint *ep)
 			continue;
 
 		parcel->disconnected = true;
-		update = true;
+		if (parcel->busy || parcel->state != TEE_PARCEL_CREATING)
+			update = true;
 	}
 	spin_unlock(&parcel_lock);
 
@@ -792,7 +1010,8 @@ void rpmi_tee_memory_disconnect(struct rpmi_tee_endpoint *ep)
 		if (parcel->receiver != ep || parcel->busy)
 			continue;
 
-		parcel->state = TEE_PARCEL_CREATED;
+		if (parcel->state != TEE_PARCEL_CREATING)
+			parcel->state = TEE_PARCEL_CREATED;
 	}
 	spin_unlock(&parcel_lock);
 }
