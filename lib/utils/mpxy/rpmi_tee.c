@@ -8,6 +8,7 @@
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_string.h>
 #include <sbi_utils/mpxy/rpmi_tee.h>
+#include <sbi_utils/mpxy/fdt_mpxy_bridge.h>
 
 static SBI_LIST_HEAD(tee_endpoints);
 
@@ -209,6 +210,29 @@ invalid:
 			       RPMI_ERR_INVALID_PARAM);
 }
 
+static int tee_complete_response(struct mpxy_bridge_src_ctx *src,
+				 const void *data, u32 len)
+{
+	if (len < sizeof(u32) || len > src->resp_bufsize || len % sizeof(u32))
+		return SBI_EINVAL;
+
+	sbi_memcpy(src->respbuf, data, len);
+	src->resp_length = len;
+	return 0;
+}
+
+int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len)
+{
+	const struct rpmi_tee_call_resp *resp = data;
+	u32 error = cpu_to_le32(RPMI_ERR_IO);
+
+	if (src->header.service_id != RPMI_TEE_CALL ||
+	    len < sizeof(*resp) || le32_to_cpu(resp->status) != RPMI_SUCCESS ||
+	    le32_to_cpu(resp->service_data_len) != len - sizeof(*resp))
+		return tee_complete_response(src, &error, sizeof(error));
+	return tee_complete_response(src, data, len);
+}
+
 int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		     u32 len, void *response, u32 maxlen,
 		     unsigned long *response_len)
@@ -218,6 +242,17 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 	if (!caller || !rpmi_tee_endpoint_available(caller))
 		return rpmi_tee_status(response, maxlen, response_len,
 				       RPMI_ERR_DENIED);
+	if (service == RPMI_TEE_ENABLE_NOTIFICATION) {
+		const struct rpmi_enable_notification_req *req = data;
+
+		if (len != sizeof(*req) ||
+		    le32_to_cpu(req->req_state) >= RPMI_EVENT_NOTIF_MAX_COUNT)
+			return rpmi_tee_status(response, maxlen, response_len,
+					       RPMI_ERR_INVALID_PARAM);
+		/* The TEE service group defines no notification events. */
+		return rpmi_tee_status(response, maxlen, response_len,
+				       RPMI_ERR_NOTSUPP);
+	}
 	if (service >= RPMI_TEE_PROBE_FEATURES &&
 	    service <= RPMI_TEE_PROBE_ENDPOINT)
 		return tee_probe(caller, service, data, len, response, maxlen,

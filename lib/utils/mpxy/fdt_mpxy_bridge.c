@@ -24,13 +24,23 @@
 #include <sbi_utils/mailbox/rpmi_mailbox.h>
 #include <sbi_utils/mailbox/mailbox.h>
 #include <sbi_utils/mpxy/fdt_mpxy_bridge.h>
+#ifdef CONFIG_FDT_MPXY_RPMI_TEE
+#include <sbi_utils/mpxy/rpmi_tee.h>
+#endif
 
 #define SBI_MPXY_BRIDGE_COMPATIBLE  "opensbi,rpmi-mpxy-reqfwd-bridge"
 #define SBI_MPXY_BRIDGE_PROP_DOMAIN_NAME "riscv,domain"
 #define SBI_MPXY_BRIDGE_PROP_CHAN "riscv,sbi-mpxy-channel-id"
 
 
+#ifdef CONFIG_FDT_MPXY_RPMI_TEE
+extern const struct mpxy_bridge_source_driver mpxy_rpmi_tee_driver;
+#endif
+
 static const struct mpxy_bridge_source_driver *source_drivers[] = {
+#ifdef CONFIG_FDT_MPXY_RPMI_TEE
+	&mpxy_rpmi_tee_driver,
+#endif
 };
 
 static uint16_t token = 0;
@@ -402,7 +412,16 @@ static int bridge_send_message_with_response(struct sbi_mpxy_channel *channel,
 			return SBI_EALREADY;
 		if (msg_len > (u16)-1 || msg_len % sizeof(u32))
 			return SBI_EINVAL;
-		if (slot->active_source >= 0) {
+		if (source->ops->request) {
+			ret = source->ops->request(source->ep.dom, msg_id,
+						   msgbuf, msg_len, respbuf,
+						   resp_bufsize, resp_len);
+			if (ret != SBI_ENOTSUPP)
+				return ret;
+		}
+		if (slot->active_source >= 0 ||
+		    (source->ops->require_waiting_retrieval &&
+		     !dst->waiting)) {
 			if (resp_bufsize < sizeof(u32))
 				return SBI_ENOSPC;
 			*(u32 *)respbuf = cpu_to_le32(RPMI_ERR_BUSY);
@@ -456,6 +475,11 @@ static int bridge_rpmi_get_attribute_group(void *context,
 {
 	struct bridge_rpmi_endpoint *ep = context;
 	(void)chan;
+
+#ifdef CONFIG_FDT_MPXY_RPMI_TEE
+	if (ep->rpmi_data.servicegrp_id == RPMI_SRVGRP_TEE)
+		return rpmi_tee_channel_get_attribute(attr_id, out_value);
+#endif
 
 	if (attr_id == RPMI_CHANNEL_ATTR_SERVICEGROUP_VERSION) {
 		*out_value = RPMI_VERSION(1, 0);

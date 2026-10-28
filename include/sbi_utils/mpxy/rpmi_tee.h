@@ -11,6 +11,10 @@
 #include <sbi_utils/mailbox/rpmi_msgprot.h>
 
 struct mpxy_bridge_src_ctx;
+struct mpxy_rpmi_data;
+
+extern const struct mpxy_rpmi_data rpmi_tee_local_data;
+int rpmi_tee_channel_get_attribute(u32 attr_id, u32 *value);
 
 /** Physical endpoint provisioned by trusted firmware configuration. */
 struct rpmi_tee_endpoint {
@@ -30,6 +34,7 @@ static inline bool rpmi_tee_endpoint_available(struct rpmi_tee_endpoint *ep)
 	return atomic_read(&ep->available) != 0;
 }
 
+int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len);
 struct rpmi_tee_endpoint *rpmi_tee_endpoint_by_role(bool tee);
 int rpmi_tee_register_endpoint(const void *fdt, int nodeoff);
 struct rpmi_tee_endpoint *rpmi_tee_endpoint_by_id(u32 id);
