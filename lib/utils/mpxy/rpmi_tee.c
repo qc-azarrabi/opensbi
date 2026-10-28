@@ -8,6 +8,7 @@
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_string.h>
 #include <sbi_utils/mpxy/rpmi_tee.h>
+#include <sbi_utils/mpxy/fdt_mpxy_bridge.h>
 
 static SBI_LIST_HEAD(tee_endpoints);
 
@@ -261,6 +262,39 @@ out_status:
 	*response_len = sizeof(*status_resp);
 
 	return 0;
+}
+
+static int tee_complete_response(struct mpxy_bridge_src_ctx *src,
+				 const void *data, u32 len)
+{
+	if (len < sizeof(u32) || len > src->resp_bufsize || len % sizeof(u32))
+		return SBI_EINVAL;
+
+	sbi_memcpy(src->respbuf, data, len);
+	src->resp_length = len;
+
+	return 0;
+}
+
+int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len)
+{
+	const struct rpmi_tee_call_resp *resp = data;
+	u32 error = cpu_to_le32(RPMI_ERR_IO);
+
+	if (src->header.service_id != RPMI_TEE_CALL)
+		return tee_complete_response(src, &error, sizeof(error));
+
+	if (len < sizeof(*resp))
+		return tee_complete_response(src, &error, sizeof(error));
+
+	/* Outer RPMI errors -> RPMI_ERR_IO as aborted request by TEE. */
+	if (le32_to_cpu(resp->status) != RPMI_SUCCESS)
+		return tee_complete_response(src, &error, sizeof(error));
+
+	if (le32_to_cpu(resp->service_data_len) != len - sizeof(*resp))
+		return tee_complete_response(src, &error, sizeof(error));
+
+	return tee_complete_response(src, data, len);
 }
 
 /* Handle requests locally; return SBI_ENOTSUPP to request forwarding. */

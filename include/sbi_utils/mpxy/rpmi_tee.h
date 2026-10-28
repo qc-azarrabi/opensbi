@@ -11,6 +11,7 @@
 #include <sbi_utils/mailbox/rpmi_msgprot.h>
 
 struct mpxy_bridge_src_ctx;
+struct mpxy_rpmi_data;
 
 /* Endpoint registry */
 
@@ -39,11 +40,18 @@ struct rpmi_tee_endpoint *rpmi_tee_endpoint_by_domain(struct sbi_domain *dom);
 struct rpmi_tee_endpoint *rpmi_tee_endpoint_by_role(bool tee);
 struct sbi_domain *rpmi_tee_endpoint_domain(struct rpmi_tee_endpoint *ep);
 
+/* MPXY channel configuration */
+
+extern const struct mpxy_rpmi_data rpmi_tee_local_data;
+int rpmi_tee_channel_get_attribute(u32 attr_id, u32 *value);
+
 /* Request dispatch and bridge integration */
 
 /** Process local services; SBI_ENOTSUPP requests validated forwarding. */
 int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		     u32 len, void *response, u32 maxlen,
 		     unsigned long *response_len);
+
+int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len);
 
 #endif
