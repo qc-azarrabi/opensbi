@@ -363,6 +363,11 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		goto out_status;
 	}
 
+	if (service >= RPMI_TEE_MEMORY_PARCEL_CREATE &&
+	    service <= RPMI_TEE_MEMORY_SEGMENT_RECEIVE)
+		return rpmi_tee_memory_request(caller, service, data, len,
+					       response, maxlen, response_len);
+
 	/* A validated call returns SBI_ENOTSUPP to request forwarding. */
 	if (service == RPMI_TEE_CALL)
 		return tee_call(caller, data, len, response, maxlen,

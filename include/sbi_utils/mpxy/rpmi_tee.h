@@ -54,4 +54,11 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 
 int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len);
 
+/* Memory parcels */
+
+u32 rpmi_tee_memory_feature(u32 feature);
+int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
+			    const void *data, u32 len, void *response,
+			    u32 maxlen, unsigned long *response_len);
+
 #endif
