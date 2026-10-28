@@ -49,6 +49,9 @@ struct mpxy_bridge_source_driver {
 struct mpxy_bridge_source_ops {
 	/** Require a pending destination retrieval before forwarding. */
 	bool require_waiting_retrieval;
+	/** Validate the source and destination domain association at boot. */
+	int (*check_domains)(struct sbi_domain *source,
+			     struct sbi_domain *dest);
 	/** Handle a local service; SBI_ENOTSUPP selects forwarding. */
 	int (*request)(struct sbi_domain *dom, u32 service, const void *data,
 		       u32 len, void *response, u32 maxlen,

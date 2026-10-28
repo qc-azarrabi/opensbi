@@ -792,6 +792,11 @@ static int bridge_try_bind_domain(struct mpxy_bridge *br,
 			return SBI_EINVAL;
 		if (!src->ops)
 			return SBI_ENOTSUPP;
+		if (src->ops->check_domains) {
+			ret = src->ops->check_domains(source, br->dst.ep.dom);
+			if (ret)
+				return ret;
+		}
 		ret = mpxy_rpmi_no_mbox_init(&src->ep.rpmi_endpoint.rpmi_data,
 					     src->ep.channel_id,
 					     src->ep.domain_name);

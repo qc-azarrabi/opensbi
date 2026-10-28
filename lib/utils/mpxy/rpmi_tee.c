@@ -4,7 +4,11 @@
  */
 
 #include <libfdt.h>
+#include <sbi/riscv_asm.h>
 #include <sbi/sbi_error.h>
+#include <sbi/sbi_hart.h>
+#include <sbi/sbi_hart_pmp.h>
+#include <sbi/sbi_scratch.h>
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_string.h>
 #include <sbi_utils/mpxy/rpmi_tee.h>
@@ -210,6 +214,80 @@ invalid:
 			       RPMI_ERR_INVALID_PARAM);
 }
 
+static bool tee_has_service(struct rpmi_tee_endpoint *ep, const u8 *uuid)
+{
+	u32 i;
+
+	for (i = 0; i < ep->service_count; i++)
+		if (!sbi_memcmp(ep->services + i * RPMI_TEE_UUID_SIZE, uuid,
+				RPMI_TEE_UUID_SIZE))
+			return true;
+	return false;
+}
+
+int rpmi_tee_check_domains(struct sbi_domain *source, struct sbi_domain *dest)
+{
+	struct rpmi_tee_endpoint *src = rpmi_tee_endpoint_by_domain(source);
+	struct rpmi_tee_endpoint *target = rpmi_tee_endpoint_by_domain(dest);
+
+	if (!src || !target || !target->tee)
+		return SBI_EINVAL;
+	/* OP-TEE must initialize before the REE takes over the boot hart. */
+	if (source != dest && (source->boot_hartid != dest->boot_hartid ||
+			       source->init_order <= dest->init_order))
+		return SBI_EINVAL;
+	/* The initial profile excludes architectural state not yet isolated. */
+	if (misa_extension('H') || misa_extension('V') ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SSTC) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SMSTATEEN) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SSSTATEEN) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SMCDELEG) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SSCCFG) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SMCTR) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SSCTR))
+		return SBI_ENOTSUPP;
+	/* Domain migration needs synchronized protection updates. */
+	if (__riscv_xlen != 64 || sbi_hart_count() != 1 ||
+	    !sbi_hart_pmp_count(sbi_scratch_thishart_ptr()) ||
+	    sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SMEPMP))
+		return SBI_ENOTSUPP;
+	return 0;
+}
+
+static int tee_call(struct rpmi_tee_endpoint *caller, const void *data,
+		    u32 len, void *response, u32 maxlen,
+		    unsigned long *response_len)
+{
+	const struct rpmi_tee_call_req *req = data;
+	struct rpmi_tee_endpoint *target;
+
+	if (caller->tee)
+		return rpmi_tee_status(response, maxlen, response_len,
+				       RPMI_ERR_NOTSUPP);
+	if (len < sizeof(*req) ||
+	    le32_to_cpu(req->sender_id) != caller->id ||
+	    le32_to_cpu(req->service_data_len) != len - sizeof(*req))
+		goto invalid;
+	target = rpmi_tee_endpoint_by_id(le32_to_cpu(req->target_id));
+	if (!target || !target->tee ||
+	    !rpmi_tee_endpoint_available(target) ||
+	    !tee_has_service(target, req->service))
+		goto invalid;
+	/* The single-hart caller cannot overwrite its pending request. */
+	return SBI_ENOTSUPP;
+invalid:
+	return rpmi_tee_status(response, maxlen, response_len,
+			       RPMI_ERR_INVALID_PARAM);
+}
+
 static int tee_complete_response(struct mpxy_bridge_src_ctx *src,
 				 const void *data, u32 len)
 {
@@ -253,6 +331,9 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		return rpmi_tee_status(response, maxlen, response_len,
 				       RPMI_ERR_NOTSUPP);
 	}
+	if (service == RPMI_TEE_CALL)
+		return tee_call(caller, data, len, response, maxlen,
+				response_len);
 	if (service >= RPMI_TEE_PROBE_FEATURES &&
 	    service <= RPMI_TEE_PROBE_ENDPOINT)
 		return tee_probe(caller, service, data, len, response, maxlen,
