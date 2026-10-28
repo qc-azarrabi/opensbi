@@ -193,26 +193,33 @@ void sbi_free_from(struct sbi_heap_control *hpctrl, void *ptr)
 
 	sbi_list_del(&np->head);
 
+	/* Insert by address so both adjacent free ranges can be merged. */
 	sbi_list_for_each_entry(n, &hpctrl->free_space_list, head) {
-		if ((np->addr + np->size) == n->addr) {
-			n->addr = np->addr;
-			n->size += np->size;
-			sbi_list_add_tail(&np->head, &hpctrl->free_node_list);
-			np = NULL;
-			break;
-		} else if (np->addr == (n->addr + n->size)) {
-			n->size += np->size;
-			sbi_list_add_tail(&np->head, &hpctrl->free_node_list);
-			np = NULL;
-			break;
-		} else if ((n->addr + n->size) < np->addr) {
-			sbi_list_add(&np->head, &n->head);
-			np = NULL;
+		if (np->addr < n->addr) {
+			sbi_list_add_tail(&np->head, &n->head);
 			break;
 		}
 	}
-	if (np)
+	if (&n->head == &hpctrl->free_space_list)
 		sbi_list_add_tail(&np->head, &hpctrl->free_space_list);
+
+	if (np->head.prev != &hpctrl->free_space_list) {
+		n = sbi_list_entry(np->head.prev, struct heap_node, head);
+		if (n->addr + n->size == np->addr) {
+			n->size += np->size;
+			sbi_list_del(&np->head);
+			sbi_list_add_tail(&np->head, &hpctrl->free_node_list);
+			np = n;
+		}
+	}
+	if (np->head.next != &hpctrl->free_space_list) {
+		n = sbi_list_entry(np->head.next, struct heap_node, head);
+		if (np->addr + np->size == n->addr) {
+			np->size += n->size;
+			sbi_list_del(&n->head);
+			sbi_list_add_tail(&n->head, &hpctrl->free_node_list);
+		}
+	}
 
 	spin_unlock(&hpctrl->lock);
 }
