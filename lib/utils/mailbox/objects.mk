@@ -16,3 +16,6 @@ libsbiutils-objs-$(CONFIG_RPMI_MAILBOX) += mailbox/rpmi_mailbox.o
 
 carray-fdt_mailbox_drivers-$(CONFIG_FDT_MAILBOX_RPMI_SHMEM) += fdt_mailbox_rpmi_shmem
 libsbiutils-objs-$(CONFIG_FDT_MAILBOX_RPMI_SHMEM) += mailbox/fdt_mailbox_rpmi_shmem.o
+
+carray-fdt_mailbox_drivers-$(CONFIG_FDT_MAILBOX_RPMI_TEE_MSI) += fdt_mailbox_rpmi_tee_msi
+libsbiutils-objs-$(CONFIG_FDT_MAILBOX_RPMI_TEE_MSI) += mailbox/fdt_mailbox_rpmi_tee_msi.o

@@ -24,6 +24,18 @@ config FDT_MAILBOX_RPMI_SHMEM
 	depends on RPMI_MAILBOX
 	default n
 
+config FDT_MAILBOX_RPMI_TEE_MSI
+	bool "Firmware RPMI TEE System MSI sources"
+	depends on FDT_MPXY_RPMI_TEE
+	select IRQCHIP_IMSIC
+	select RPMI_MAILBOX
+	default n
+	help
+	  Provide firmware-backed System MSI sources for RPMI TEE signal buses.
+	  The RPMI System MSI proxy exposes these sources to supervisor domains.
+	  Signal delivery writes the configured supervisor IMSIC interrupt file.
+	  Routes and domain permissions are supplied by trusted configuration.
+
 endif
 
 endmenu
