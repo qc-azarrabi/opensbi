@@ -13,6 +13,7 @@ libsbiutils-objs-$(CONFIG_FDT_MPXY) += mpxy/fdt_mpxy_drivers.carray.o
 libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI) += mpxy/fdt_mpxy_rpmi.o
 
 libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_TEE) += mpxy/rpmi_tee.o
+libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_TEE) += mpxy/rpmi_tee_memory.o
 libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_TEE) += mpxy/mpxy_source_tee.o
 libsbiutils-objs-$(CONFIG_FDT_MPXY_RPMI_TEE) += mpxy/fdt_mpxy_rpmi_tee.o
 

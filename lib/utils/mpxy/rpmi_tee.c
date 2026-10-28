@@ -104,6 +104,7 @@ int rpmi_tee_register_endpoint(const void *fdt, int nodeoff)
 	name = fdt_get_name(fdt, nodeoff, NULL);
 	sbi_strncpy(ep->name, name, sizeof(ep->name) - 1);
 	sbi_list_add_tail(&ep->node, &tee_endpoints);
+	rpmi_tee_memory_set_fdt(fdt);
 	return 0;
 }
 
@@ -132,6 +133,7 @@ static int tee_probe(struct rpmi_tee_endpoint *caller, u32 service,
 		if (id > RPMI_TEE_FEATURE_MULTISEGMENT_OPS)
 			return rpmi_tee_status(response, maxlen, response_len,
 					       RPMI_ERR_INVALID_PARAM);
+		value = rpmi_tee_memory_feature(id);
 		((u32 *)response)[0] = cpu_to_le32(RPMI_SUCCESS);
 		((u32 *)response)[1] = cpu_to_le32(value);
 		*response_len = 2 * sizeof(u32);
@@ -331,6 +333,10 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		return rpmi_tee_status(response, maxlen, response_len,
 				       RPMI_ERR_NOTSUPP);
 	}
+	if (service >= RPMI_TEE_MEMORY_PARCEL_CREATE &&
+	    service <= RPMI_TEE_MEMORY_SEGMENT_RECEIVE)
+		return rpmi_tee_memory_request(caller, service, data, len,
+					       response, maxlen, response_len);
 	if (service == RPMI_TEE_CALL)
 		return tee_call(caller, data, len, response, maxlen,
 				response_len);

@@ -36,6 +36,11 @@ static inline bool rpmi_tee_endpoint_available(struct rpmi_tee_endpoint *ep)
 
 int rpmi_tee_check_domains(struct sbi_domain *source, struct sbi_domain *dest);
 int rpmi_tee_complete(struct mpxy_bridge_src_ctx *src, void *data, u32 len);
+void rpmi_tee_memory_set_fdt(const void *fdt);
+u32 rpmi_tee_memory_feature(u32 feature);
+int rpmi_tee_memory_request(struct rpmi_tee_endpoint *caller, u32 service,
+			    const void *data, u32 len, void *response,
+			    u32 maxlen, unsigned long *response_len);
 struct rpmi_tee_endpoint *rpmi_tee_endpoint_by_role(bool tee);
 int rpmi_tee_register_endpoint(const void *fdt, int nodeoff);
 struct rpmi_tee_endpoint *rpmi_tee_endpoint_by_id(u32 id);
