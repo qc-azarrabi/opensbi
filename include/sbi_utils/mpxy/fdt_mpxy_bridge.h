@@ -23,7 +23,8 @@ struct mpxy_bridge_source;
 struct mpxy_bridge_dst_ctx {
 	void          *respbuf;
 	u32            resp_bufsize;
-	unsigned long *resp_len_ptr;
+	unsigned long resp_len;
+	bool waiting;
 	u32            start_index;
 };
 

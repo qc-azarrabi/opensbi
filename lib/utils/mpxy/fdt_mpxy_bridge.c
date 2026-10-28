@@ -199,13 +199,12 @@ struct mpxy_bridge *bridge_find_by_nodeoff(int nodeoff)
 	return NULL;
 }
 
-static void bridge_switch_domain(struct mpxy_bridge *br,
-				 struct sbi_mpxy_channel *channel)
+static int bridge_switch_domain(struct mpxy_bridge *br,
+				struct sbi_mpxy_channel *channel)
 {
 	if (channel == &br->dst.ep.ch)
-		sbi_domain_context_exit();
-	else
-		sbi_domain_context_enter(br->dst.ep.ch.owner_domain);
+		return sbi_domain_context_exit();
+	return sbi_domain_context_enter(br->dst.ep.ch.owner_domain);
 }
 
 static void bridge_save_dst_ctx(struct mpxy_bridge_hart_slot *slot,
@@ -214,7 +213,7 @@ static void bridge_save_dst_ctx(struct mpxy_bridge_hart_slot *slot,
 {
 	slot->dst_resp.respbuf      = respbuf;
 	slot->dst_resp.resp_bufsize = resp_bufsize;
-	slot->dst_resp.resp_len_ptr = resp_len;
+	slot->dst_resp.resp_len     = 0;
 	slot->dst_resp.start_index  = msgbuf ? ((u32 *)msgbuf)[0] : 0;
 }
 
@@ -229,6 +228,8 @@ static int bridge_dst_complete(struct mpxy_bridge *br,
 	int active_source;
 	int ret = SBI_OK;
 
+	if (resp_max_len < sizeof(*resp))
+		return SBI_ENOSPC;
 	resp = (struct rpmi_request_complete_resp *)respbuf;
 	active_source = slot->active_source;
 
@@ -240,14 +241,14 @@ static int bridge_dst_complete(struct mpxy_bridge *br,
 
 		src = &slot->src_ctx[active_source];
 
-		if (!src->occupied || !src->retrieved) {
+		if (!src->occupied || !src->retrieved || src->completed) {
 			resp->status = RPMI_ERR_NO_DATA;
 			break;
 		}
 
 		source = &br->sources[active_source];
 		ret = source->ops->complete(src, msgbuf, msg_len);
-		src->completed = true;
+		src->completed = !ret;
 		if (ret)
 			resp->status   = RPMI_ERR_NOTSUPP;
 		else
@@ -265,6 +266,23 @@ static int bridge_dst_complete(struct mpxy_bridge *br,
 	return SBI_OK;
 }
 
+/* Complete the source exchange before returning to its domain. */
+static int bridge_complete_source(struct mpxy_bridge *br,
+				  struct mpxy_bridge_hart_slot *slot,
+				  int source_index)
+{
+	struct mpxy_bridge_source *source = &br->sources[source_index];
+	struct mpxy_bridge_src_ctx *src = &slot->src_ctx[source_index];
+	int ret;
+
+	ret = sbi_mpxy_complete_message(source->ep.dom, src->resp_length);
+	if (!ret) {
+		slot->active_source = -1;
+		bridge_src_ctx_release(src);
+	}
+	return ret;
+}
+
 static int bridge_dst_send_message_with_response(
 				struct mpxy_bridge *br,
 				struct mpxy_bridge_hart_slot *slot,
@@ -279,35 +297,43 @@ static int bridge_dst_send_message_with_response(
 
 	switch (msg_id) {
 		case REQFWD_RETRIEVE_CURRENT_MESSAGE:
-			source_index = bridge_find_pending_source(br, slot);
-			bridge_save_dst_ctx(slot, respbuf, resp_bufsize, resp_len, msgbuf);
-			/*
-			 * Waiting for the message from one of the sources.
-			 * schedule the next domain.
-			 */
+			if (msg_len != sizeof(u32))
+				return SBI_EINVAL;
+			bridge_save_dst_ctx(slot, respbuf, resp_bufsize,
+					    resp_len, msgbuf);
+			source_index = slot->active_source;
+			/* Retrieve further chunks from the active request. */
+			if (source_index < 0 || slot->src_ctx[source_index].completed)
+				source_index = bridge_find_pending_source(br, slot);
 			if (source_index < 0) {
-					source_index = bridge_find_completed_source(br, slot);
-					if (source_index >= 0) {
-						/* it is time to send reponse back to the source domain. */
-						source = &br->sources[source_index];
-						src = &slot->src_ctx[source_index];
-						slot->active_source = -1;
-						*resp_len = src->resp_length;
-						bridge_src_ctx_release(src);
-					}
-				bridge_switch_domain(br, &br->dst.ep.ch);
+				if (slot->dst_resp.start_index)
+					return SBI_EINVAL;
+				source_index = bridge_find_completed_source(br, slot);
+				if (source_index >= 0) {
+					ret = bridge_complete_source(br, slot,
+								     source_index);
+					if (ret)
+						return ret;
+				}
+				slot->dst_resp.waiting = true;
+				ret = bridge_switch_domain(br, &br->dst.ep.ch);
+				if (ret)
+					slot->dst_resp.waiting = false;
 			} else {
+				slot->active_source = source_index;
 				source = &br->sources[source_index];
 				src = &slot->src_ctx[source_index];
-				/* hand over the transfer to the source driver. */
 				ret = source->ops->xfer(src, &slot->dst_resp);
-				src->retrieved = true;
+				if (!ret) {
+					*resp_len = slot->dst_resp.resp_len;
+					src->retrieved = true;
+				}
 			}
 			break;
 
 		case REQFWD_COMPLETE_CURRENT_MESSAGE:
 			ret = bridge_dst_complete(br, slot, msgbuf, msg_len,
-						respbuf, resp_bufsize, resp_len);
+						  respbuf, resp_bufsize, resp_len);
 			break;
 
 		default:
@@ -340,6 +366,7 @@ static int bridge_send_message_with_response(struct sbi_mpxy_channel *channel,
 	struct mpxy_bridge_src_ctx *src;
 	struct mpxy_bridge_source *source;
 	struct mpxy_bridge_hart_slot *slot = NULL;
+	struct mpxy_bridge_dst_ctx *dst;
 	int source_index;
 	int ret = SBI_OK;
 
@@ -353,6 +380,7 @@ static int bridge_send_message_with_response(struct sbi_mpxy_channel *channel,
 		ret = bridge_get_current_slot(br, &slot);
 		if (ret)
 			break;
+		dst = &slot->dst_resp;
 
 		if (channel == &br->dst.ep.ch) {
 			ret = bridge_dst_send_message_with_response(br, slot, msg_id,
@@ -363,33 +391,58 @@ static int bridge_send_message_with_response(struct sbi_mpxy_channel *channel,
 		}
 
 		source_index = bridge_source_index(br, channel);
-		if (source_index < 0) {
+		if (source_index < 0 || !br->dst.ep.dom) {
 			ret = SBI_ERR_NOT_SUPPORTED;
 			break;
 		}
 
 		src    = &slot->src_ctx[source_index];
 		source = &br->sources[source_index];
+		if (src->occupied)
+			return SBI_EALREADY;
+		if (msg_len > (u16)-1 || msg_len % sizeof(u32))
+			return SBI_EINVAL;
+		if (slot->active_source >= 0) {
+			if (resp_bufsize < sizeof(u32))
+				return SBI_ENOSPC;
+			*(u32 *)respbuf = cpu_to_le32(RPMI_ERR_BUSY);
+			*resp_len = sizeof(u32);
+			return 0;
+		}
 
 		src->header.servicegroup_id =
 			cpu_to_le16(source->ep.rpmi_endpoint.rpmi_data.servicegrp_id);
 		src->header.service_id = msg_id;
 		src->header.flags = 0;
-		src->header.datalen = cpu_to_le16(sizeof(src->header)) + msg_len;
+		src->header.datalen = cpu_to_le16(msg_len);
 		src->header.token = cpu_to_le16(++token);
 
 		bridge_src_ctx_set(src, msgbuf, msg_len, respbuf,
 				   resp_bufsize, resp_len);
-
 		ret = bridge_src_ctx_occupy(src);
 		slot->active_source = source_index;
+		if (ret)
+			break;
 
-		if (!ret) {
-			if (slot->dst_resp.respbuf) {
-				ret = source->ops->xfer(src, &slot->dst_resp);
+		if (dst->waiting) {
+			ret = source->ops->xfer(src, dst);
+			if (!ret)
+				ret = sbi_mpxy_complete_message(br->dst.ep.dom,
+								dst->resp_len);
+			if (!ret) {
 				src->retrieved = true;
+				dst->waiting = false;
 			}
-			bridge_switch_domain(br, &br->sources[source_index].ep.ch);
+		}
+		if (!ret)
+			ret = bridge_switch_domain(br, &source->ep.ch);
+		if (ret) {
+			if (src->retrieved) {
+				sbi_mpxy_cancel_completion(br->dst.ep.dom);
+				dst->waiting = true;
+			}
+			slot->active_source = -1;
+			bridge_src_ctx_release(src);
 		}
 	} while (0);
 
@@ -404,9 +457,14 @@ static int bridge_rpmi_get_attribute_group(void *context,
 	struct bridge_rpmi_endpoint *ep = context;
 	(void)chan;
 
+	if (attr_id == RPMI_CHANNEL_ATTR_SERVICEGROUP_VERSION) {
+		*out_value = RPMI_VERSION(1, 0);
+		return SBI_OK;
+	}
+
 	switch (attr_id) {
 		case RPMI_CHANNEL_ATTR_PROTOCOL_VERSION:
-			*((u32 *)out_value) = 1;
+			*out_value = RPMI_VERSION(2, 0);
 			break;
 		case RPMI_CHANNEL_ATTR_MAX_DATA_LEN:
 			*((u32 *)out_value) = SBI_MPXY_BRIDGE_DEFAULT_MSG_DATA_MAXLEN;
@@ -479,6 +537,7 @@ static int bridge_rpmi_setup_group(void **context,
 	ep = container_of(data, struct bridge_rpmi_endpoint, rpmi_data);
 
 	ep->domain = dom;
+	ep->channel->owner_domain = dom;
 	*context = ep;
 	return ret;
 }
@@ -677,48 +736,46 @@ static bool sbi_hartmask_equal(const struct sbi_hartmask *a,
 	return true;
 }
 
-static void bridge_try_bind_domain(struct mpxy_bridge *br,
-				   const struct sbi_domain *dom)
+static int bridge_try_bind_domain(struct mpxy_bridge *br,
+				  const struct sbi_domain *dom)
 {
-	u32 i, rc;
+	struct sbi_domain *source;
+	u32 i;
+	int ret;
 
 	if (!br || !dom)
-		return;
+		return SBI_EINVAL;
 
 	if (!br->dst.ep.dom &&
 	    bridge_name_match(dom->name, br->dst.ep.domain_name)) {
-		bridge_register_destination(br, (struct sbi_domain *)dom);
+		ret = bridge_register_destination(br, (struct sbi_domain *)dom);
+		if (ret)
+			return ret;
 	}
+	if (!br->dst.ep.dom)
+		return 0;
 
 	for (i = 0; i < br->source_count; i++) {
-		if (!br->sources[i].ep.dom &&
-			bridge_name_match(dom->name, br->sources[i].ep.domain_name)) {
-			br->sources[i].ep.dom = (struct sbi_domain *)dom;
+		struct mpxy_bridge_source *src = &br->sources[i];
 
-			rc = mpxy_rpmi_no_mbox_init(&br->sources[i].ep.rpmi_endpoint.rpmi_data,
-				    br->sources[i].ep.channel_id,
-				    br->sources[i].ep.domain_name);
-			if (rc) {
-				sbi_printf("%s: mpxy_rpmi_no_mbox_init failed with ret %d for source[%u]\n",
-				   __func__, rc, i);
-				br->sources[i].ep.dom = NULL;
-			}
-		}
+		if (src->ep.dom)
+			continue;
+		source = sbi_domain_find_by_name(src->ep.domain_name);
+		if (!source)
+			continue;
+		if (!sbi_hartmask_equal(source->possible_harts,
+					br->dst.ep.dom->possible_harts))
+			return SBI_EINVAL;
+		if (!src->ops)
+			return SBI_ENOTSUPP;
+		ret = mpxy_rpmi_no_mbox_init(&src->ep.rpmi_endpoint.rpmi_data,
+					     src->ep.channel_id,
+					     src->ep.domain_name);
+		if (ret)
+			return ret;
+		src->ep.dom = source;
 	}
-
-	if (br->dst.ep.dom) {
-		for (i = 0; i < br->source_count; i++) {
-			if (br->sources[i].ep.dom &&
-			    !sbi_hartmask_equal(
-				br->sources[i].ep.dom->possible_harts,
-				br->dst.ep.dom->possible_harts)) {
-				sbi_printf("%s: source[%u] and destination "
-					   "have different possible harts\n",
-					   __func__, i);
-				br->sources[i].ep.dom = NULL;
-			}
-		}
-	}
+	return 0;
 }
 
 static int bridge_domain_notifier(struct sbi_domain *dom,
@@ -726,13 +783,17 @@ static int bridge_domain_notifier(struct sbi_domain *dom,
 				  void *priv)
 {
 	struct mpxy_bridge *br;
+	int ret;
 
 	(void)priv;
 
-	if (event == SBI_DOMAIN_NOTIFY_EVENT_REGISTER)
-		sbi_list_for_each_entry(br, &mpxy_bridge_list, node)
-			bridge_try_bind_domain(br, dom);
-
+	if (event == SBI_DOMAIN_NOTIFY_EVENT_REGISTER) {
+		sbi_list_for_each_entry(br, &mpxy_bridge_list, node) {
+			ret = bridge_try_bind_domain(br, dom);
+			if (ret)
+				return ret;
+		}
+	}
 	return SBI_OK;
 }
 
@@ -939,6 +1000,7 @@ static int bridge_init(const void *fdt, int nodeoff,
 {
 	struct mpxy_bridge *br = NULL;
 	struct sbi_scratch *scratch;
+	struct sbi_domain *dom;
 	u32                 hart_count;
 	u32                 source_count;
 	u32                 i;
@@ -978,8 +1040,17 @@ static int bridge_init(const void *fdt, int nodeoff,
 		for (i = 0; i < hart_count; i++)
 			bridge_slot_release(br, &br->store.slots[i]);
 
-		if ((ret = bridge_register_notifier()))
+		ret = bridge_register_notifier();
+		if (ret) {
 			sbi_list_del(&br->node);
+			break;
+		}
+		sbi_domain_for_each(dom) {
+			ret = bridge_try_bind_domain(br, dom);
+			if (ret)
+				sbi_panic("REQFWD domain binding failed: %d\n",
+					  ret);
+		}
 
 	} while (0);
 
