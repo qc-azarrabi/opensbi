@@ -17,6 +17,21 @@ config FDT_MPXY_RPMI_TEE
 	depends on FDT_MPXY_BRIDGE
 	default n
 
+config FDT_MPXY_RPMI_TEE_TEST_SHARED_RAM
+	bool "TEST: RPMI TEE parcels over statically shared RAM"
+	depends on FDT_MPXY_RPMI_TEE
+	default n
+	help
+	  Enable parcel protocol testing without dynamic memory protection.
+	  Both endpoint domains must already have supervisor read/write access
+	  to the shared normal RAM. Keep private TEE and firmware RAM protected
+	  through the trusted domain configuration.
+
+	  Parcel identities, ranges and lifecycle are still checked, but access
+	  is not narrowed or revoked on acceptance, release or reclamation.
+	  Executable parcels are unsupported. This is for functional bring-up
+	  only and must not be used to validate isolation or revocation.
+
 config FDT_MPXY_RPMI
 	bool "FDT based MPXY RPMI drivers"
 	depends on FDT_MAILBOX && FDT_MPXY

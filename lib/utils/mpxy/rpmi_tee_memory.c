@@ -7,6 +7,7 @@
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_locks.h>
 #include <sbi/sbi_hart.h>
+#include <sbi/sbi_console.h>
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_string.h>
 #include <sbi_utils/fdt/fdt_helper.h>
@@ -59,6 +60,9 @@ void rpmi_tee_memory_set_fdt(const void *fdt)
 	if (ram_initialized)
 		return;
 	ram_initialized = true;
+#ifdef CONFIG_FDT_MPXY_RPMI_TEE_TEST_SHARED_RAM
+	sbi_printf("RPMI TEE: TEST shared RAM; no dynamic access revocation\n");
+#endif
 	/* Copy policy before either endpoint can modify its boot DT memory. */
 	while ((node = fdt_node_offset_by_prop_value(fdt, node,
 						     "device_type",
@@ -79,6 +83,65 @@ void rpmi_tee_memory_set_fdt(const void *fdt)
 	}
 }
 
+#ifdef CONFIG_FDT_MPXY_RPMI_TEE_TEST_SHARED_RAM
+/* Static domain policy supplies access; this profile never changes it. */
+static bool parcel_protection_available(void)
+{
+	return true;
+}
+
+static int parcel_protect_check(struct tee_parcel *parcel)
+{
+	struct sbi_domain *creator, *receiver;
+	unsigned long access = SBI_DOMAIN_READ | SBI_DOMAIN_WRITE;
+	u32 i;
+
+	creator = rpmi_tee_endpoint_domain(parcel->creator);
+	receiver = rpmi_tee_endpoint_domain(parcel->receiver);
+	if (!creator || !receiver)
+		return SBI_ENODEV;
+	if ((parcel->creator_access | parcel->access) & RPMI_TEE_ACCESS_EXEC)
+		return SBI_ENOTSUPP;
+	/* Decoding already checked RAM bounds and reserved parcel ranges. */
+	for (i = 0; i < parcel->block_count; i++) {
+		const struct tee_block *block = &parcel->blocks[i];
+		unsigned long size = (unsigned long)block->pages <<
+				     RPMI_TEE_PAGE_SHIFT;
+
+		if (!sbi_domain_check_addr_range(creator, block->address, size,
+						 PRV_S, access) ||
+		    !sbi_domain_check_addr_range(receiver, block->address, size,
+						 PRV_S, access))
+			return SBI_EDENIED;
+	}
+	return 0;
+}
+
+static int parcel_protect_create(struct tee_parcel *parcel)
+{
+	return 0;
+}
+
+static int parcel_protect_accept(struct tee_parcel *parcel)
+{
+	return 0;
+}
+
+static int parcel_protect_release(struct tee_parcel *parcel)
+{
+	return 0;
+}
+
+static int parcel_protect_reclaim(struct tee_parcel *parcel)
+{
+	return 0;
+}
+
+static int parcel_protect_disconnect(struct rpmi_tee_endpoint *ep)
+{
+	return 0;
+}
+#else
 /* Query backend readiness without publishing unsupported memory features. */
 static bool parcel_protection_available(void)
 {
@@ -88,13 +151,6 @@ static bool parcel_protection_available(void)
 	 * Smsdid/Smmpt infrastructure rather than rebuilding PMP region arrays.
 	 */
 	return false;
-}
-
-static int memory_init(void)
-{
-	if (!ram_range_count || !parcel_protection_available())
-		return SBI_ENOTSUPP;
-	return 0;
 }
 
 /* Validate effective permissions without changing either domain's access. */
@@ -157,6 +213,15 @@ static int parcel_protect_disconnect(struct rpmi_tee_endpoint *ep)
 	 * lock is not held; backend synchronization must not depend on it.
 	 */
 	return SBI_ENOTSUPP;
+}
+
+#endif
+
+static int memory_init(void)
+{
+	if (!ram_range_count || !parcel_protection_available())
+		return SBI_ENOTSUPP;
+	return 0;
 }
 
 /* The busy reservation pins the descriptor while enforcement runs unlocked. */
