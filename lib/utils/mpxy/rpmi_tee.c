@@ -264,6 +264,58 @@ out_status:
 	return 0;
 }
 
+static bool tee_has_service(struct rpmi_tee_endpoint *ep, const u8 *uuid)
+{
+	u32 i;
+
+	for (i = 0; i < ep->service_count; i++)
+		if (!sbi_memcmp(ep->services + i * RPMI_TEE_UUID_SIZE, uuid,
+				RPMI_TEE_UUID_SIZE))
+			return true;
+
+	return false;
+}
+
+/* Validate TEE_CALL and select forwarding or prepare an error response. */
+static int tee_call(struct rpmi_tee_endpoint *caller, const void *data,
+		    u32 len, void *response, u32 maxlen,
+		    unsigned long *response_len)
+{
+	struct rpmi_tee_status_resp *status_resp = response;
+	const struct rpmi_tee_call_req *req = data;
+	struct rpmi_tee_endpoint *target;
+	s32 status = RPMI_ERR_INVALID_PARAM;
+
+	/* Only REE-to-TEE calls are supported, for now. */
+	if (caller->tee) {
+		status = RPMI_ERR_NOTSUPP;
+		goto out_status;
+	}
+
+	if (len < sizeof(*req) ||
+	    le32_to_cpu(req->sender_id) != caller->id ||
+	    le32_to_cpu(req->service_data_len) != len - sizeof(*req))
+		goto out_status;
+
+	target = rpmi_tee_endpoint_by_id(le32_to_cpu(req->target_id));
+	if (!target || !target->tee ||
+	    !rpmi_tee_endpoint_available(target) ||
+	    !tee_has_service(target, req->service))
+		goto out_status;
+
+	/* Ask the bridge to forward the validated call to the target TEE. */
+	return SBI_ENOTSUPP;
+
+out_status:
+	if (maxlen < sizeof(*status_resp))
+		return SBI_ENOSPC;
+
+	status_resp->status = cpu_to_le32(status);
+	*response_len = sizeof(*status_resp);
+
+	return 0;
+}
+
 static int tee_complete_response(struct mpxy_bridge_src_ctx *src,
 				 const void *data, u32 len)
 {
@@ -310,6 +362,11 @@ int rpmi_tee_request(struct sbi_domain *dom, u32 service, const void *data,
 		status = RPMI_ERR_DENIED;
 		goto out_status;
 	}
+
+	/* A validated call returns SBI_ENOTSUPP to request forwarding. */
+	if (service == RPMI_TEE_CALL)
+		return tee_call(caller, data, len, response, maxlen,
+				response_len);
 
 	if (service >= RPMI_TEE_PROBE_FEATURES &&
 	    service <= RPMI_TEE_PROBE_ENDPOINT)
